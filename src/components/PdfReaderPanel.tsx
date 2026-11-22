@@ -1,6 +1,8 @@
 import React, {useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react';
 import type {PDFDocumentProxy, RenderTask} from 'pdfjs-dist';
+import JSZip from 'jszip';
 import {renderAsync as renderDocxAsync} from 'docx-preview';
+import mammoth from 'mammoth/mammoth.browser';
 import {
   ArrowLeft,
   Check,
@@ -27,10 +29,6 @@ import {
   formatCourseDisplayTitle,
 } from '../services/parser';
 import {
-  buildMsWordOfficeUri,
-  loadLocalRootAbsolutePath,
-} from '../services/filesystem';
-import {
   DOCX_MIME,
   getCourseFileFormat,
   ODT_MIME,
@@ -56,6 +54,10 @@ import {
 } from '../services/googleDrive';
 import {FileFormatBadge} from './FileFormatBadge';
 
+if (typeof window !== 'undefined' && !(window as unknown as {JSZip?: typeof JSZip}).JSZip) {
+  (window as unknown as {JSZip?: typeof JSZip}).JSZip = JSZip;
+}
+
 interface PdfReaderPanelProps {
   document: CourseDocument | null;
   targetPage: number;
@@ -63,7 +65,6 @@ interface PdfReaderPanelProps {
   highlightQuery: string;
   titleFormat?: TitleFormatSettings;
   rules?: SortRule[];
-  localRootAbsPath?: string;
   onPageChange: (page: number) => void;
   onCloseMobile?: () => void;
   onNotify?: (text: string, tone?: 'info' | 'error') => void;
@@ -403,6 +404,209 @@ function renderOdtBlock(block: OdtBlock, key: React.Key): React.ReactNode {
   }
 }
 
+function renderSafeMammothNode(node: ChildNode, key: string): React.ReactNode {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return node.textContent;
+  }
+  if (node.nodeType !== Node.ELEMENT_NODE) {
+    return null;
+  }
+
+  const el = node as Element;
+  const tag = el.tagName.toLowerCase();
+  const children = Array.from(el.childNodes).map((child, idx) =>
+    renderSafeMammothNode(child, `${key}-${idx}`)
+  );
+
+  switch (tag) {
+    case 'h1':
+      return (
+        <h1 key={key} className="text-2xl font-bold text-slate-900 mt-5 mb-2.5 leading-tight">
+          {children}
+        </h1>
+      );
+    case 'h2':
+      return (
+        <h2 key={key} className="text-xl font-bold text-slate-900 mt-4 mb-2 leading-snug">
+          {children}
+        </h2>
+      );
+    case 'h3':
+      return (
+        <h3 key={key} className="text-lg font-semibold text-slate-900 mt-3.5 mb-1.5 leading-snug">
+          {children}
+        </h3>
+      );
+    case 'h4':
+    case 'h5':
+    case 'h6':
+      return (
+        <h4 key={key} className="text-base font-semibold text-slate-900 mt-3 mb-1">
+          {children}
+        </h4>
+      );
+    case 'p':
+      return (
+        <p key={key} className="text-[14.5px] leading-relaxed text-slate-800 my-2">
+          {children}
+        </p>
+      );
+    case 'strong':
+    case 'b':
+      return (
+        <strong key={key} className="font-semibold text-slate-950">
+          {children}
+        </strong>
+      );
+    case 'em':
+    case 'i':
+      return (
+        <em key={key} className="italic">
+          {children}
+        </em>
+      );
+    case 'u':
+      return (
+        <u key={key} className="underline">
+          {children}
+        </u>
+      );
+    case 's':
+    case 'del':
+      return (
+        <s key={key} className="line-through">
+          {children}
+        </s>
+      );
+    case 'sup':
+      return <sup key={key}>{children}</sup>;
+    case 'sub':
+      return <sub key={key}>{children}</sub>;
+    case 'br':
+      return <br key={key} />;
+    case 'hr':
+      return <hr key={key} className="my-4 border-slate-300" />;
+    case 'blockquote':
+      return (
+        <blockquote
+          key={key}
+          className="my-3 pl-4 border-l-2 border-slate-300 text-slate-700 italic"
+        >
+          {children}
+        </blockquote>
+      );
+    case 'ul':
+      return (
+        <ul key={key} className="list-disc pl-6 my-2 space-y-1 text-[14.5px] text-slate-800">
+          {children}
+        </ul>
+      );
+    case 'ol':
+      return (
+        <ol key={key} className="list-decimal pl-6 my-2 space-y-1 text-[14.5px] text-slate-800">
+          {children}
+        </ol>
+      );
+    case 'li':
+      return (
+        <li key={key} className="leading-relaxed">
+          {children}
+        </li>
+      );
+    case 'table':
+      return (
+        <div key={key} className="my-4 overflow-x-auto">
+          <table className="w-full border-collapse border border-slate-300 text-sm text-slate-800">
+            {children}
+          </table>
+        </div>
+      );
+    case 'thead':
+      return (
+        <thead key={key} className="bg-slate-100 font-semibold text-slate-900">
+          {children}
+        </thead>
+      );
+    case 'tbody':
+      return <tbody key={key}>{children}</tbody>;
+    case 'tr':
+      return <tr key={key}>{children}</tr>;
+    case 'th':
+      return (
+        <th
+          key={key}
+          className="border border-slate-300 bg-slate-100 px-3 py-1.5 text-left font-semibold align-top"
+        >
+          {children}
+        </th>
+      );
+    case 'td':
+      return (
+        <td key={key} className="border border-slate-300 px-3 py-1.5 align-top">
+          {children}
+        </td>
+      );
+    case 'a': {
+      const href = el.getAttribute('href') ?? '';
+      const safeHref = /^(https?:|mailto:|#)/i.test(href.trim()) ? href : undefined;
+      return safeHref ? (
+        <a
+          key={key}
+          href={safeHref}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-blue-700 underline hover:text-blue-900"
+        >
+          {children}
+        </a>
+      ) : (
+        <span key={key}>{children}</span>
+      );
+    }
+    case 'img': {
+      const src = el.getAttribute('src') ?? '';
+      if (!/^data:image\/(png|jpe?g|gif|webp|bmp);base64,/i.test(src)) {
+        return null;
+      }
+      return (
+        <img
+          key={key}
+          src={src}
+          alt={el.getAttribute('alt') ?? 'Image du document'}
+          className="my-3 max-w-full h-auto rounded border border-slate-200"
+        />
+      );
+    }
+    case 'pre':
+      return (
+        <pre key={key} className="my-3 rounded bg-slate-100 p-3 text-xs font-mono text-slate-800 overflow-x-auto">
+          {children}
+        </pre>
+      );
+    case 'code':
+      return (
+        <code key={key} className="rounded bg-slate-100 px-1 py-0.5 text-xs font-mono text-slate-800">
+          {children}
+        </code>
+      );
+    case 'div':
+    case 'span':
+    case 'section':
+    case 'article':
+      return <React.Fragment key={key}>{children}</React.Fragment>;
+    default:
+      return <React.Fragment key={key}>{children}</React.Fragment>;
+  }
+}
+
+function renderSafeMammothHtml(html: string): React.ReactNode {
+  if (!html.trim() || typeof DOMParser === 'undefined') return null;
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  return Array.from(doc.body.childNodes).map((child, idx) =>
+    renderSafeMammothNode(child, `mammoth-${idx}`)
+  );
+}
+
 export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   document: courseDoc,
   targetPage,
@@ -410,7 +614,6 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   highlightQuery,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
   rules,
-  localRootAbsPath,
   onPageChange,
   onCloseMobile,
   onNotify,
@@ -424,8 +627,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   // Office reader refs (.docx / .odt zoom + cleanup)
   const officeSpacerRef = useRef<HTMLDivElement>(null);
   const officeInnerRef = useRef<HTMLDivElement>(null);
-  const docxBodyRef = useRef<HTMLDivElement>(null);
-  const docxStyleRef = useRef<HTMLDivElement>(null);
+  const docxContainerRef = useRef<HTMLDivElement>(null);
   const odtObjectUrlsRef = useRef<string[]>([]);
   const officeNaturalWidthRef = useRef<number>(794);
 
@@ -460,6 +662,8 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   const [pageInput, setPageInput] = useState(String(targetPage));
 
   const [docxBuffer, setDocxBuffer] = useState<ArrayBuffer | null>(null);
+  const [docxPreviewError, setDocxPreviewError] = useState<string | null>(null);
+  const [docxFallbackHtml, setDocxFallbackHtml] = useState<string | null>(null);
   const [docxFallbackText, setDocxFallbackText] = useState<string | null>(null);
   const [docxReady, setDocxReady] = useState(false);
   const [odtDoc, setOdtDoc] = useState<ParsedOdtDocument | null>(null);
@@ -510,6 +714,14 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     const spacer = officeSpacerRef.current;
     const inner = officeInnerRef.current;
     if (!spacer || !inner) return;
+
+    if (!hasLoadedContent) {
+      spacer.style.width = '';
+      spacer.style.height = '';
+      inner.style.transform = '';
+      return;
+    }
+
     const natW = Math.max(320, inner.scrollWidth || 794);
     const natH = Math.max(320, inner.scrollHeight || 1123);
     officeNaturalWidthRef.current = natW;
@@ -517,7 +729,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     spacer.style.width = `${Math.ceil(natW * s)}px`;
     spacer.style.height = `${Math.ceil(natH * s)}px`;
     inner.style.transform = `scale(${s})`;
-  }, []);
+  }, [hasLoadedContent]);
 
   // Apply zoom while capturing anchor so scrolling stays anchored to cursor or active page
   const applyZoom = useCallback(
@@ -594,7 +806,15 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
       container.scrollTop = Math.max(0, anchor.scrollRatio * maxScroll);
     }
-  }, [scale, docFormat, docxReady, odtDoc, updateOfficeScaleLayout]);
+  }, [
+    scale,
+    docFormat,
+    docxReady,
+    docxFallbackHtml,
+    docxFallbackText,
+    odtDoc,
+    updateOfficeScaleLayout,
+  ]);
 
   // Observe natural DOCX/ODT size changes (e.g. images finishing decode)
   useEffect(() => {
@@ -657,8 +877,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
         URL.revokeObjectURL(url);
       }
       odtObjectUrlsRef.current = [];
-      if (docxBodyRef.current) docxBodyRef.current.innerHTML = '';
-      if (docxStyleRef.current) docxStyleRef.current.innerHTML = '';
+      if (docxContainerRef.current) docxContainerRef.current.innerHTML = '';
     };
 
     async function load() {
@@ -669,6 +888,8 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       setNumPages(0);
       setPageDimensions([]);
       setDocxBuffer(null);
+      setDocxPreviewError(null);
+      setDocxFallbackHtml(null);
       setDocxFallbackText(null);
       setDocxReady(false);
       setOdtDoc(null);
@@ -777,10 +998,10 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
           if (courseDoc.source === 'cloud' && courseDoc.driveFileId) {
             const {bytes} = await fetchCourseDocumentBytes(courseDoc, abortController.signal);
             if (cancelled) return;
-            arrayBuffer = bytes.buffer.slice(
-              bytes.byteOffset,
-              bytes.byteOffset + bytes.byteLength
-            ) as ArrayBuffer;
+            const cleanCopy = new Uint8Array(bytes.byteLength);
+            cleanCopy.set(bytes);
+            const driveBlob = new Blob([cleanCopy.buffer], {type: DOCX_MIME});
+            arrayBuffer = await driveBlob.arrayBuffer();
           } else if (courseDoc.handle) {
             const file = await courseDoc.handle.getFile();
             if (cancelled) return;
@@ -798,7 +1019,10 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
           );
           scaleRef.current = initialScale;
           setScale(initialScale);
+          setDocxPreviewError(null);
+          setDocxFallbackHtml(null);
           setDocxFallbackText(null);
+          setDocxReady(false);
           setDocxBuffer(arrayBuffer);
         } else if (format === 'odt') {
           const {bytes} = await fetchCourseDocumentBytes(courseDoc, abortController.signal);
@@ -847,68 +1071,116 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [courseDoc]);
 
-  // Render DOCX only after loading ends and the DOM container refs are guaranteed mounted
+  // Render DOCX via docx-preview once containerRef is mounted; fall back to mammoth HTML + exact error on failure
   useEffect(() => {
-    if (docFormat !== 'docx' || !docxBuffer || isLoading || error) return;
+    if (
+      docFormat !== 'docx' ||
+      !docxBuffer ||
+      isLoading ||
+      error ||
+      docxFallbackHtml !== null ||
+      docxFallbackText !== null
+    ) {
+      return;
+    }
 
     let cancelled = false;
     let rafId = 0;
 
     const runRender = async () => {
-      const bodyEl = docxBodyRef.current;
-      const styleEl = docxStyleRef.current;
-      if (!bodyEl || !styleEl || cancelled) return;
+      const targetContainer = docxContainerRef.current;
+      if (!targetContainer || !targetContainer.isConnected || cancelled) return;
 
-      bodyEl.innerHTML = '';
-      styleEl.innerHTML = '';
+      targetContainer.innerHTML = '';
 
       try {
-        await renderDocxAsync(docxBuffer, bodyEl, styleEl, {
+        await renderDocxAsync(docxBuffer, targetContainer, undefined, {
           inWrapper: true,
           ignoreWidth: false,
-          ignoreHeight: false,
           breakPages: true,
-          useBase64URL: true,
-          renderHeaders: true,
-          renderFooters: true,
         });
         if (cancelled) return;
 
         const hasVisibleContent =
-          bodyEl.children.length > 0 || (bodyEl.textContent?.trim().length ?? 0) > 0;
+          targetContainer.querySelector('.docx-wrapper, section.docx') !== null ||
+          targetContainer.children.length > 0 ||
+          (targetContainer.textContent?.trim().length ?? 0) > 0;
+
         if (!hasVisibleContent) {
-          throw new Error('Contenu DOCX rendu vide.');
+          throw new Error('docx-preview a retourné un document vide.');
         }
 
+        setDocxPreviewError(null);
+        setDocxFallbackHtml(null);
         setDocxFallbackText(null);
         setDocxReady(true);
         requestAnimationFrame(() => {
           if (!cancelled) updateOfficeScaleLayout();
         });
       } catch (docxErr) {
-        console.warn('docx-preview a échoué, bascule en texte brut:', docxErr);
+        const exactError =
+          docxErr instanceof Error
+            ? docxErr.message || String(docxErr)
+            : String(docxErr);
+        console.warn('docx-preview a échoué, bascule vers mammoth:', docxErr);
         if (cancelled) return;
+
+        setDocxPreviewError(exactError);
+
         try {
-          const extracted = await extractDocxTextLowRam(new Uint8Array(docxBuffer));
+          const mammothApi =
+            typeof mammoth?.convertToHtml === 'function'
+              ? mammoth
+              : (mammoth as unknown as {default?: typeof mammoth})?.default ??
+                (typeof window !== 'undefined'
+                  ? (window as unknown as {mammoth?: typeof mammoth}).mammoth
+                  : undefined);
+          if (!mammothApi || typeof mammothApi.convertToHtml !== 'function') {
+            throw new Error('Module Mammoth introuvable dans le bundle navigateur.');
+          }
+          const mammothRes = await mammothApi.convertToHtml({
+            arrayBuffer: docxBuffer,
+          });
           if (cancelled) return;
-          const plain = extracted.pages.map((p) => p.text).join('\n\n').trim();
-          setDocxFallbackText(
-            plain || 'Ce document .docx ne contient aucun texte lisible.'
-          );
-          setDocxReady(true);
-        } catch {
+          if (mammothRes.value && mammothRes.value.trim().length > 0) {
+            setDocxFallbackHtml(mammothRes.value);
+            setDocxFallbackText(null);
+            setDocxReady(true);
+            requestAnimationFrame(() => {
+              if (!cancelled) updateOfficeScaleLayout();
+            });
+            return;
+          }
+          throw new Error('Aucun contenu HTML extrait par Mammoth.');
+        } catch (mammothErr) {
+          console.warn('mammoth.convertToHtml a également échoué:', mammothErr);
           if (cancelled) return;
-          setDocxFallbackText(
-            'Impossible d’afficher la mise en page de ce fichier .docx. Utilisez « Ouvrir dans l’appli par défaut ».'
-          );
-          setDocxReady(true);
+          try {
+            const extracted = await extractDocxTextLowRam(new Uint8Array(docxBuffer));
+            if (cancelled) return;
+            const plain = extracted.pages.map((p) => p.text).join('\n\n').trim();
+            setDocxFallbackHtml(null);
+            setDocxFallbackText(
+              plain || 'Ce document .docx ne contient aucun texte lisible.'
+            );
+            setDocxReady(true);
+          } catch {
+            if (cancelled) return;
+            const mammothErrMsg =
+              mammothErr instanceof Error ? mammothErr.message : String(mammothErr);
+            setDocxFallbackHtml(null);
+            setDocxFallbackText(
+              `Impossible d’afficher ce document .docx.\nErreur docx-preview : ${exactError}\nErreur Mammoth : ${mammothErrMsg}`
+            );
+            setDocxReady(true);
+          }
         }
       }
     };
 
     rafId = requestAnimationFrame(() => {
       if (cancelled) return;
-      if (!docxBodyRef.current || !docxStyleRef.current) {
+      if (!docxContainerRef.current || !docxContainerRef.current.isConnected) {
         rafId = requestAnimationFrame(() => {
           if (!cancelled) void runRender();
         });
@@ -921,7 +1193,15 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       cancelled = true;
       cancelAnimationFrame(rafId);
     };
-  }, [docFormat, docxBuffer, isLoading, error, updateOfficeScaleLayout]);
+  }, [
+    docFormat,
+    docxBuffer,
+    isLoading,
+    error,
+    docxFallbackHtml,
+    docxFallbackText,
+    updateOfficeScaleLayout,
+  ]);
 
   // Handle initial page placement and subsequent search jumps cleanly for PDFs
   useEffect(() => {
@@ -1124,34 +1404,10 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     }
   };
 
-  // Mode PC Local: open original .docx directly in Word via ms-word: if root absolute path is configured,
-  // or trigger a clean download with official MIME type & exact file.name (.odt / fallback .docx / .pdf)
+  // Clean external launch via official MIME Blob download & exact file.name (no ms-word: / file:///)
   const handleOpenInDefaultApp = async () => {
     if (!courseDoc || !courseDoc.handle) return;
     try {
-      const effectiveRootPath = (
-        localRootAbsPath ?? loadLocalRootAbsolutePath()
-      ).trim();
-
-      if (docFormat === 'docx' && effectiveRootPath) {
-        const msWordUri = buildMsWordOfficeUri(
-          effectiveRootPath,
-          courseDoc.relativePath
-        );
-        if (msWordUri) {
-          const protocolLink = window.document.createElement('a');
-          protocolLink.href = msWordUri;
-          protocolLink.style.display = 'none';
-          window.document.body.appendChild(protocolLink);
-          protocolLink.click();
-          window.document.body.removeChild(protocolLink);
-          onNotify?.(
-            `Ouverture directe dans Word : ${courseDoc.name}`
-          );
-          return;
-        }
-      }
-
       const file = await courseDoc.handle.getFile();
       const lowerName = file.name.toLowerCase();
       const forcedMime = lowerName.endsWith('.docx')
@@ -1445,7 +1701,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
                 type="button"
                 onClick={handleOpenInDefaultApp}
                 disabled={isLoading || !!error}
-                title="Ouvrir dans l'appli par défaut (Word via ms-word: si chemin configuré, sinon téléchargement MIME officiel)"
+                title="Ouvrir dans l'appli par défaut (téléchargement propre avec type MIME officiel)"
                 aria-label="Ouvrir dans l'appli par défaut"
                 className="min-h-[34px] inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800/80 px-2.5 py-1 text-xs font-medium text-slate-200 hover:border-amber-500/50 hover:text-amber-300 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
@@ -1538,12 +1794,33 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
         ) : (
           /* A4 Light-Gray Paper Viewport for .docx and .odt */
           <div ref={officeSpacerRef} className="relative mx-auto shrink-0">
-            <div ref={officeInnerRef} className="origin-top-left inline-block">
+            <div ref={officeInnerRef} className="origin-top-left inline-block w-max min-w-[320px]">
               {docFormat === 'docx' ? (
-                docxFallbackText !== null ? (
+                docxFallbackHtml !== null ? (
                   <article className="w-[794px] min-h-[1123px] bg-white text-slate-900 px-12 py-12 md:px-14 md:py-14 shadow-2xl border border-slate-300/90 space-y-4">
-                    <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-                      Affichage simplifié en texte brut (la mise en page Word complète n’a pas pu être rendue).
+                    <div className="rounded-md border border-rose-300 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-900 space-y-1">
+                      <p className="font-semibold">
+                        Aperçu avancé (docx-preview) indisponible — Mode de secours Mammoth actif
+                      </p>
+                      {docxPreviewError && (
+                        <p className="font-mono text-[11px] text-rose-800 break-words">
+                          Erreur : {docxPreviewError}
+                        </p>
+                      )}
+                    </div>
+                    <div className="space-y-2">{renderSafeMammothHtml(docxFallbackHtml)}</div>
+                  </article>
+                ) : docxFallbackText !== null ? (
+                  <article className="w-[794px] min-h-[1123px] bg-white text-slate-900 px-12 py-12 md:px-14 md:py-14 shadow-2xl border border-slate-300/90 space-y-4">
+                    <div className="rounded-md border border-rose-300 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-900 space-y-1">
+                      <p className="font-semibold">
+                        Affichage simplifié en texte brut (docx-preview et Mammoth n’ont pas pu rendre la mise en page)
+                      </p>
+                      {docxPreviewError && (
+                        <p className="font-mono text-[11px] text-rose-800 break-words">
+                          Erreur : {docxPreviewError}
+                        </p>
+                      )}
                     </div>
                     {docxFallbackText.split(/\n{2,}/).map((para, idx) => (
                       <p key={idx} className="text-[14.5px] leading-relaxed text-slate-800 whitespace-pre-wrap">
@@ -1552,10 +1829,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
                     ))}
                   </article>
                 ) : (
-                  <div className="docx-reader-host">
-                    <div ref={docxStyleRef} />
-                    <div ref={docxBodyRef} />
-                  </div>
+                  <div ref={docxContainerRef} className="docx-reader-host" />
                 )
               ) : odtDoc ? (
                 <article className="w-[794px] min-h-[1123px] bg-white text-slate-900 px-12 py-12 md:px-14 md:py-14 shadow-2xl border border-slate-300/90">

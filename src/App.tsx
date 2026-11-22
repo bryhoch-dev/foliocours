@@ -27,7 +27,6 @@ import {
   CLASSIFY_FOLDER_NAME,
   isFileSystemAccessSupported,
   isOrganizeRootFolderName,
-  loadLocalRootAbsolutePath,
   ORGANIZE_FOLDER_NAME,
   pickRootDirectory,
   renameWorkspaceDirectory,
@@ -105,9 +104,6 @@ export default function App() {
   const [rules, setRules] = useState<SortRule[]>(() => loadSortRules());
   const [titleFormat, setTitleFormat] = useState<TitleFormatSettings>(() =>
     loadTitleFormatSettings()
-  );
-  const [localRootAbsPath, setLocalRootAbsPath] = useState<string>(() =>
-    loadLocalRootAbsolutePath()
   );
   const [importQueue, setImportQueue] = useState<ImportQueueItem[]>([]);
   const [isWritingImport, setIsWritingImport] = useState(false);
@@ -940,7 +936,6 @@ export default function App() {
           highlightQuery={highlightQuery}
           titleFormat={titleFormat}
           rules={rules}
-          localRootAbsPath={localRootAbsPath}
           onPageChange={setReaderPage}
           onNotify={showToast}
         />
@@ -1022,8 +1017,6 @@ export default function App() {
         rules={rules}
         titleFormat={titleFormat}
         sampleFilename={sampleFilename}
-        localRootAbsPath={localRootAbsPath}
-        onChangeLocalRootAbsPath={setLocalRootAbsPath}
         onChangeTitleFormat={handleSaveTitleFormat}
         onClose={() => setIsSettingsModalOpen(false)}
         onReindexAll={() => {
