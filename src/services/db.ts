@@ -7,13 +7,23 @@ import type {
 } from '../types/course';
 
 const DB_NAME = 'foliocours-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 const STORE_HANDLES = 'handles';
 const STORE_DOCUMENTS = 'documents';
 const STORE_PAGES = 'pages';
+const STORE_CLOUD_FILES = 'cloud_files';
 
 const CLOUD_INDEX_KEY = 'cloud_search_index';
+
+export interface CachedCloudFile {
+  driveFileId: string;
+  relativePath: string;
+  name: string;
+  modifiedTime: string;
+  blob: Blob;
+  cachedAt: number;
+}
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -34,6 +44,9 @@ function openDatabase(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_PAGES)) {
         const pageStore = db.createObjectStore(STORE_PAGES, {keyPath: 'id'});
         pageStore.createIndex('by_docPath', 'docPath', {unique: false});
+      }
+      if (!db.objectStoreNames.contains(STORE_CLOUD_FILES)) {
+        db.createObjectStore(STORE_CLOUD_FILES, {keyPath: 'driveFileId'});
       }
     };
 
@@ -98,6 +111,74 @@ export async function clearCloudSearchIndex(): Promise<void> {
   const db = await openDatabase();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_HANDLES, 'readwrite');
+    tx.objectStore(STORE_HANDLES).delete(CLOUD_INDEX_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function getCachedCloudFile(
+  driveFileId: string
+): Promise<CachedCloudFile | null> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_CLOUD_FILES, 'readonly');
+    const req = tx.objectStore(STORE_CLOUD_FILES).get(driveFileId);
+    req.onsuccess = () => resolve((req.result as CachedCloudFile) ?? null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function saveCachedCloudFile(record: CachedCloudFile): Promise<void> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_CLOUD_FILES, 'readwrite');
+    tx.objectStore(STORE_CLOUD_FILES).put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function getCloudCacheStats(): Promise<{
+  cachedFileCount: number;
+  cachedBytes: number;
+  indexDocCount: number;
+}> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_CLOUD_FILES, STORE_HANDLES], 'readonly');
+    const filesReq = tx.objectStore(STORE_CLOUD_FILES).openCursor();
+    const indexReq = tx.objectStore(STORE_HANDLES).get(CLOUD_INDEX_KEY);
+
+    let cachedFileCount = 0;
+    let cachedBytes = 0;
+    let indexDocCount = 0;
+
+    filesReq.onsuccess = () => {
+      const cursor = filesReq.result;
+      if (cursor) {
+        const val = cursor.value as CachedCloudFile;
+        cachedFileCount++;
+        cachedBytes += val.blob?.size ?? 0;
+        cursor.continue();
+      }
+    };
+
+    indexReq.onsuccess = () => {
+      const idx = indexReq.result as CloudSearchIndexPayload | undefined;
+      indexDocCount = idx?.documents?.length ?? 0;
+    };
+
+    tx.oncomplete = () => resolve({cachedFileCount, cachedBytes, indexDocCount});
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function clearAllOfflineCloudCache(): Promise<void> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_CLOUD_FILES, STORE_HANDLES], 'readwrite');
+    tx.objectStore(STORE_CLOUD_FILES).clear();
     tx.objectStore(STORE_HANDLES).delete(CLOUD_INDEX_KEY);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);

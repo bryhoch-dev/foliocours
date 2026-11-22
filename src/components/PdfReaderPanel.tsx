@@ -31,7 +31,13 @@ import {
 import {
   DOCX_MIME,
   getCourseFileFormat,
+  ODT_MIME,
+  PDF_MIME,
 } from '../services/fileFormats';
+import {
+  getCachedCloudFile,
+  saveCachedCloudFile,
+} from '../services/db';
 import {
   destroyPdfDocument,
   loadPdfDocumentFromBytes,
@@ -47,6 +53,7 @@ import {
 import {
   authenticateGoogleDrive,
   fetchCloudPdfBytes,
+  fetchDriveFileModifiedTime,
   getMemoryAccessToken,
   getSavedDriveClientId,
 } from '../services/googleDrive';
@@ -826,30 +833,88 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     return () => ro.disconnect();
   }, [docFormat, hasLoadedContent, updateOfficeScaleLayout]);
 
-  // Helper to obtain raw bytes/File for any document (local handle or Drive API)
+  // Helper to obtain raw bytes/File for any document (local handle or smart IndexedDB-cached Drive API)
   const fetchCourseDocumentBytes = useCallback(
     async (doc: CourseDocument, signal: AbortSignal): Promise<{bytes: Uint8Array; file?: File}> => {
       if (doc.source === 'cloud' && doc.driveFileId) {
+        const cached = await getCachedCloudFile(doc.driveFileId).catch(() => null);
+
+        if (typeof navigator !== 'undefined' && !navigator.onLine && cached) {
+          return {bytes: new Uint8Array(await cached.blob.arrayBuffer())};
+        }
+
         let token = getMemoryAccessToken();
         if (!token) {
-          token = await authenticateGoogleDrive(getSavedDriveClientId());
-        }
-        try {
-          const bytes = await fetchCloudPdfBytes(token, doc.driveFileId, signal);
-          return {bytes};
-        } catch (fetchErr) {
-          if (
-            !signal.aborted &&
-            !getMemoryAccessToken() &&
-            fetchErr instanceof Error &&
-            fetchErr.message.includes('Session Google expirée')
-          ) {
+          try {
             token = await authenticateGoogleDrive(getSavedDriveClientId());
-            const bytes = await fetchCloudPdfBytes(token, doc.driveFileId, signal);
-            return {bytes};
+          } catch (authErr) {
+            if (cached && !signal.aborted) {
+              return {bytes: new Uint8Array(await cached.blob.arrayBuffer())};
+            }
+            throw authErr;
           }
-          throw fetchErr;
         }
+
+        const runWith401Retry = async <T,>(fn: (activeToken: string) => Promise<T>): Promise<T> => {
+          try {
+            return await fn(token!);
+          } catch (err) {
+            if (
+              !signal.aborted &&
+              !getMemoryAccessToken() &&
+              err instanceof Error &&
+              err.message.includes('Session Google expirée')
+            ) {
+              token = await authenticateGoogleDrive(getSavedDriveClientId());
+              return fn(token);
+            }
+            throw err;
+          }
+        };
+
+        let remoteModifiedTime: string | null = doc.driveModifiedTime ?? null;
+        try {
+          remoteModifiedTime = await runWith401Retry((t) =>
+            fetchDriveFileModifiedTime(t, doc.driveFileId!, signal)
+          );
+        } catch (metaErr) {
+          if (signal.aborted) throw metaErr;
+          if (cached) {
+            return {bytes: new Uint8Array(await cached.blob.arrayBuffer())};
+          }
+          // Continue to download attempt if metadata check failed cleanly without cache
+        }
+
+        if (
+          cached &&
+          remoteModifiedTime &&
+          cached.modifiedTime === remoteModifiedTime
+        ) {
+          return {bytes: new Uint8Array(await cached.blob.arrayBuffer())};
+        }
+
+        const bytes = await runWith401Retry((t) =>
+          fetchCloudPdfBytes(t, doc.driveFileId!, signal)
+        );
+
+        const format = doc.format ?? getCourseFileFormat(doc.name) ?? 'pdf';
+        const mimeType =
+          format === 'docx' ? DOCX_MIME : format === 'odt' ? ODT_MIME : PDF_MIME;
+        const cleanCopy = new Uint8Array(bytes.byteLength);
+        cleanCopy.set(bytes);
+        const blob = new Blob([cleanCopy.buffer], {type: mimeType});
+
+        await saveCachedCloudFile({
+          driveFileId: doc.driveFileId,
+          relativePath: doc.relativePath,
+          name: doc.name,
+          modifiedTime:
+            remoteModifiedTime || doc.driveModifiedTime || new Date().toISOString(),
+          blob,
+          cachedAt: Date.now(),
+        }).catch(() => {});
+
+        return {bytes};
       }
       if (doc.handle) {
         const file = await doc.handle.getFile();

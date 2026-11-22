@@ -3,6 +3,7 @@ import type {
   CourseDocument,
   DriveBackupPlan,
   DriveBackupPlanItem,
+  DriveDeletePlanItem,
   DriveSyncRecord,
 } from '../types/course';
 import {exportSearchIndexForCloud} from './db';
@@ -334,6 +335,60 @@ export async function authenticateGoogleDrive(
   return tokenResult.accessToken;
 }
 
+export interface RemoteDriveFolderNode {
+  id: string;
+  name: string;
+  relativePath: string;
+  parentId: string;
+  depth: number;
+  childFolderIds: Set<string>;
+  childFileIds: Set<string>;
+  otherFileCount: number;
+}
+
+export interface RemoteDriveFileNode {
+  id: string;
+  name: string;
+  relativePath: string;
+  parentId: string;
+  mimeType: string;
+  size: number;
+  modifiedTime: string;
+  modifiedTimeMs: number;
+}
+
+export interface RemoteDriveInventory {
+  rootFolderId: string;
+  folderById: Map<string, RemoteDriveFolderNode>;
+  folderIdByPath: Map<string, string>;
+  filesByPath: Map<string, RemoteDriveFileNode>;
+  duplicateFiles: RemoteDriveFileNode[];
+  searchIndexFileId: string | null;
+  searchIndexModifiedTime: string | null;
+}
+
+export interface DriveMirrorAnalysisResult {
+  plan: DriveBackupPlan;
+  inventory: RemoteDriveInventory | null;
+}
+
+export interface DriveMirrorProgress {
+  phase: 'scan' | 'upload' | 'delete' | 'cleanup' | 'index';
+  current: number;
+  total: number;
+  fileName: string;
+}
+
+export interface DriveMirrorSyncResult {
+  uploaded: number;
+  deleted: number;
+  deletedFolders: number;
+  indexUpdated: boolean;
+}
+
+/**
+ * Legacy cache-only plan builder kept for compatibility if needed synchronously.
+ */
 export function buildDriveBackupPlan(documents: CourseDocument[]): DriveBackupPlan {
   const cache = getDriveSyncCache();
   const toUpload: DriveBackupPlanItem[] = [];
@@ -358,7 +413,7 @@ export function buildDriveBackupPlan(documents: CourseDocument[]): DriveBackupPl
     }
   }
 
-  return {toUpload, unchangedCount, totalBytes};
+  return {rootFolderId: null, toUpload, toDelete: [], unchangedCount, totalBytes};
 }
 
 function escapeDriveQueryValue(val: string): string {
@@ -446,24 +501,31 @@ async function findDriveFolder(
   parentId?: string
 ): Promise<string | null> {
   const escapedName = escapeDriveQueryValue(folderName);
-  const parentClause = parentId ? ` and '${escapeDriveQueryValue(parentId)}' in parents` : '';
+  const parentClause = parentId
+    ? ` and '${escapeDriveQueryValue(parentId)}' in parents`
+    : ` and 'root' in parents`;
   const q = `name = '${escapedName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false${parentClause}`;
-  const files = await listDriveFilesPaginated(
+  let files = await listDriveFilesPaginated(
     accessToken,
     q,
     'nextPageToken, files(id, name)'
   );
+  if (files.length === 0 && !parentId) {
+    const fallbackQ = `name = '${escapedName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+    files = await listDriveFilesPaginated(
+      accessToken,
+      fallbackQ,
+      'nextPageToken, files(id, name)'
+    );
+  }
   return files[0]?.id ?? null;
 }
 
-async function findOrCreateDriveFolder(
+async function createDriveFolder(
   accessToken: string,
   folderName: string,
   parentId?: string
 ): Promise<string> {
-  const existingId = await findDriveFolder(accessToken, folderName, parentId);
-  if (existingId) return existingId;
-
   const metadata: Record<string, unknown> = {
     name: folderName,
     mimeType: 'application/vnd.google-apps.folder',
@@ -495,6 +557,16 @@ async function findOrCreateDriveFolder(
   return created.id;
 }
 
+async function findOrCreateDriveFolder(
+  accessToken: string,
+  folderName: string,
+  parentId?: string
+): Promise<string> {
+  const existingId = await findDriveFolder(accessToken, folderName, parentId);
+  if (existingId) return existingId;
+  return createDriveFolder(accessToken, folderName, parentId);
+}
+
 async function findExistingDriveFileInFolder(
   accessToken: string,
   fileName: string,
@@ -517,7 +589,7 @@ async function uploadOrUpdateDriveBlob(
   blob: Blob,
   parentId: string,
   existingFileId?: string
-): Promise<string> {
+): Promise<{id: string; modifiedTime?: string; size?: number}> {
   const metadata = existingFileId ? {name: fileName} : {name: fileName, parents: [parentId]};
 
   const form = new FormData();
@@ -525,8 +597,10 @@ async function uploadOrUpdateDriveBlob(
   form.append('file', blob);
 
   const endpoint = existingFileId
-    ? `https://www.googleapis.com/upload/drive/v3/files/${existingFileId}?uploadType=multipart&fields=id`
-    : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id';
+    ? `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(
+        existingFileId
+      )}?uploadType=multipart&fields=id,modifiedTime,size`
+    : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,modifiedTime,size';
 
   const res = await fetch(endpoint, {
     method: existingFileId ? 'PATCH' : 'POST',
@@ -544,80 +618,393 @@ async function uploadOrUpdateDriveBlob(
     throw new Error(`Échec téléversement "${fileName}" : ${errText}`);
   }
 
-  const data = (await res.json()) as {id: string};
-  return data.id;
+  const data = (await res.json()) as {id: string; modifiedTime?: string; size?: string};
+  return {
+    id: data.id,
+    modifiedTime: data.modifiedTime,
+    size: data.size ? Number(data.size) : undefined,
+  };
 }
 
-export async function executeDriveBackup(
+export async function deleteDriveFileOrFolder(
   accessToken: string,
-  plan: DriveBackupPlan,
-  onProgress?: (info: {current: number; total: number; fileName: string}) => void
-): Promise<{uploaded: number; skippedExisting: number; indexUpdated: boolean}> {
-  const folderCache = new Map<string, string>();
+  fileId: string
+): Promise<void> {
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
+    {
+      method: 'DELETE',
+      headers: {Authorization: `Bearer ${accessToken}`},
+    }
+  );
+
+  if (res.status === 401) {
+    invalidateStoredAccessTokenKeepEmail();
+    throw new Error('Session Google expirée. Veuillez relancer l’opération.');
+  }
+  if (res.status === 404) {
+    return;
+  }
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Impossible de supprimer l’élément sur Drive (${res.status}) : ${errText}`);
+  }
+}
+
+/**
+ * Recursively inventories all files and folders inside `Sauvegarde_Cours` on Google Drive.
+ */
+async function scanDriveBackupTree(
+  accessToken: string,
+  rootFolderId: string
+): Promise<RemoteDriveInventory> {
+  const folderById = new Map<string, RemoteDriveFolderNode>();
+  const folderIdByPath = new Map<string, string>();
+  const filesByPath = new Map<string, RemoteDriveFileNode>();
+  const duplicateFiles: RemoteDriveFileNode[] = [];
+  let searchIndexFileId: string | null = null;
+  let searchIndexModifiedTime: string | null = null;
+
+  const rootNode: RemoteDriveFolderNode = {
+    id: rootFolderId,
+    name: ROOT_BACKUP_FOLDER_NAME,
+    relativePath: '',
+    parentId: '',
+    depth: 0,
+    childFolderIds: new Set(),
+    childFileIds: new Set(),
+    otherFileCount: 0,
+  };
+  folderById.set(rootFolderId, rootNode);
+  folderIdByPath.set('', rootFolderId);
+
+  let currentQueue: RemoteDriveFolderNode[] = [rootNode];
+  const visitedFolderIds = new Set<string>([rootFolderId]);
+
+  while (currentQueue.length > 0) {
+    const batchMap = new Map<string, RemoteDriveFolderNode>();
+    for (const f of currentQueue) {
+      batchMap.set(f.id, f);
+    }
+
+    const entries = await listChildrenByParentIds(
+      accessToken,
+      currentQueue.map((f) => f.id)
+    );
+    const nextQueue: RemoteDriveFolderNode[] = [];
+
+    for (const entry of entries) {
+      const parentId =
+        entry.parents?.find((p) => batchMap.has(p)) ?? entry.parents?.[0];
+      const parentNode = parentId ? batchMap.get(parentId) : undefined;
+      if (!parentNode) continue;
+
+      const relPath = parentNode.relativePath
+        ? `${parentNode.relativePath}/${entry.name}`
+        : entry.name;
+
+      if (entry.mimeType === 'application/vnd.google-apps.folder') {
+        if (visitedFolderIds.has(entry.id)) continue;
+        visitedFolderIds.add(entry.id);
+
+        const folderNode: RemoteDriveFolderNode = {
+          id: entry.id,
+          name: entry.name,
+          relativePath: relPath,
+          parentId: parentNode.id,
+          depth: parentNode.depth + 1,
+          childFolderIds: new Set(),
+          childFileIds: new Set(),
+          otherFileCount: 0,
+        };
+        folderById.set(entry.id, folderNode);
+        parentNode.childFolderIds.add(entry.id);
+        if (!folderIdByPath.has(relPath)) {
+          folderIdByPath.set(relPath, entry.id);
+        }
+        nextQueue.push(folderNode);
+      } else {
+        if (parentNode.depth === 0 && entry.name === SEARCH_INDEX_FILENAME) {
+          searchIndexFileId = entry.id;
+          searchIndexModifiedTime = entry.modifiedTime ?? null;
+          parentNode.otherFileCount++;
+          continue;
+        }
+
+        const isCourseFile = getCourseFileFormat(entry.name, entry.mimeType) !== null;
+        if (!isCourseFile) {
+          parentNode.otherFileCount++;
+          continue;
+        }
+
+        const modifiedTime = entry.modifiedTime || '';
+        const remoteNode: RemoteDriveFileNode = {
+          id: entry.id,
+          name: entry.name,
+          relativePath: relPath,
+          parentId: parentNode.id,
+          mimeType: entry.mimeType,
+          size: Number(entry.size || 0),
+          modifiedTime,
+          modifiedTimeMs: modifiedTime ? Date.parse(modifiedTime) : 0,
+        };
+
+        parentNode.childFileIds.add(entry.id);
+
+        const existing = filesByPath.get(relPath);
+        if (existing) {
+          // Keep the newest copy for potential PATCH, mark older duplicate for deletion
+          if (remoteNode.modifiedTimeMs > existing.modifiedTimeMs) {
+            duplicateFiles.push(existing);
+            filesByPath.set(relPath, remoteNode);
+          } else {
+            duplicateFiles.push(remoteNode);
+          }
+        } else {
+          filesByPath.set(relPath, remoteNode);
+        }
+      }
+    }
+
+    currentQueue = nextQueue;
+  }
+
+  return {
+    rootFolderId,
+    folderById,
+    folderIdByPath,
+    filesByPath,
+    duplicateFiles,
+    searchIndexFileId,
+    searchIndexModifiedTime,
+  };
+}
+
+/**
+ * Builds a complete mirror synchronization plan between the local workspace
+ * and `Sauvegarde_Cours` on Google Drive.
+ */
+export async function analyzeDriveMirrorPlan(
+  accessToken: string,
+  documents: CourseDocument[]
+): Promise<DriveMirrorAnalysisResult> {
+  const localByPath = new Map<string, CourseDocument>();
+  for (const doc of documents) {
+    if (!doc.handle) continue;
+    localByPath.set(doc.relativePath, doc);
+  }
+
+  const rootFolderId = await findDriveFolder(accessToken, ROOT_BACKUP_FOLDER_NAME);
+  if (!rootFolderId) {
+    const toUpload: DriveBackupPlanItem[] = [];
+    let totalBytes = 0;
+    for (const doc of localByPath.values()) {
+      toUpload.push({doc, action: 'new'});
+      totalBytes += doc.size;
+    }
+    return {
+      plan: {
+        rootFolderId: null,
+        toUpload,
+        toDelete: [],
+        unchangedCount: 0,
+        totalBytes,
+      },
+      inventory: null,
+    };
+  }
+
+  const inventory = await scanDriveBackupTree(accessToken, rootFolderId);
   const syncCache = getDriveSyncCache();
 
-  const rootFolderId = await findOrCreateDriveFolder(accessToken, ROOT_BACKUP_FOLDER_NAME);
-  let uploaded = 0;
-  let skippedExisting = 0;
+  const toUpload: DriveBackupPlanItem[] = [];
+  const toDelete: DriveDeletePlanItem[] = [];
+  let unchangedCount = 0;
+  let totalBytes = 0;
 
+  for (const doc of localByPath.values()) {
+    const remote = inventory.filesByPath.get(doc.relativePath);
+    if (!remote) {
+      toUpload.push({doc, action: 'new'});
+      totalBytes += doc.size;
+      continue;
+    }
+
+    const sizeDiffers = remote.size !== doc.size;
+    const localIsNewer =
+      remote.modifiedTimeMs > 0 && doc.lastModified > remote.modifiedTimeMs;
+
+    // Guard against minor PC-vs-Google clock skew if this exact file state was already uploaded to this Drive ID
+    const cachedRecord = syncCache[doc.relativePath];
+    const matchesSyncedClockSkewGuard =
+      !sizeDiffers &&
+      cachedRecord &&
+      cachedRecord.driveFileId === remote.id &&
+      cachedRecord.size === doc.size &&
+      cachedRecord.lastModified === doc.lastModified;
+
+    if (sizeDiffers || (localIsNewer && !matchesSyncedClockSkewGuard)) {
+      toUpload.push({
+        doc,
+        action: 'modified',
+        existingDriveFileId: remote.id,
+      });
+      totalBytes += doc.size;
+    } else {
+      unchangedCount++;
+    }
+  }
+
+  for (const remote of inventory.filesByPath.values()) {
+    if (!localByPath.has(remote.relativePath)) {
+      toDelete.push({
+        driveFileId: remote.id,
+        name: remote.name,
+        relativePath: remote.relativePath,
+        size: remote.size,
+        parentId: remote.parentId,
+      });
+    }
+  }
+
+  for (const dup of inventory.duplicateFiles) {
+    toDelete.push({
+      driveFileId: dup.id,
+      name: dup.name,
+      relativePath: dup.relativePath,
+      size: dup.size,
+      parentId: dup.parentId,
+    });
+  }
+
+  toUpload.sort((a, b) =>
+    a.doc.relativePath.localeCompare(b.doc.relativePath, 'fr', {numeric: true})
+  );
+  toDelete.sort((a, b) =>
+    a.relativePath.localeCompare(b.relativePath, 'fr', {numeric: true})
+  );
+
+  return {
+    plan: {
+      rootFolderId,
+      toUpload,
+      toDelete,
+      unchangedCount,
+      totalBytes,
+    },
+    inventory,
+  };
+}
+
+/**
+ * Executes full mirror synchronization (add/PATCH updates, DELETE obsolete files,
+ * bottom-up empty folder cleanup on Drive, and search_index.json refresh).
+ */
+export async function executeDriveMirrorSync(
+  accessToken: string,
+  analysis: DriveMirrorAnalysisResult,
+  options?: {
+    deleteObsolete?: boolean;
+    onProgress?: (info: DriveMirrorProgress) => void;
+  }
+): Promise<DriveMirrorSyncResult> {
+  const {plan, inventory} = analysis;
+  const deleteObsolete = options?.deleteObsolete ?? true;
+  const onProgress = options?.onProgress;
+
+  const syncCache = getDriveSyncCache();
+  const rootFolderId =
+    plan.rootFolderId ||
+    (await findOrCreateDriveFolder(accessToken, ROOT_BACKUP_FOLDER_NAME));
+
+  const folderIdByPath = new Map<string, string>(
+    inventory ? inventory.folderIdByPath : [['', rootFolderId]]
+  );
+  folderIdByPath.set('', rootFolderId);
+
+  const ensureDriveFolderChain = async (segments: string[]): Promise<string> => {
+    let currentParentId = rootFolderId;
+    let currentPath = '';
+
+    for (const seg of segments) {
+      currentPath = currentPath ? `${currentPath}/${seg}` : seg;
+      let folderId = folderIdByPath.get(currentPath);
+      if (!folderId) {
+        folderId = await findOrCreateDriveFolder(accessToken, seg, currentParentId);
+        folderIdByPath.set(currentPath, folderId);
+
+        if (inventory && !inventory.folderById.has(folderId)) {
+          const parentNode = inventory.folderById.get(currentParentId);
+          const newNode: RemoteDriveFolderNode = {
+            id: folderId,
+            name: seg,
+            relativePath: currentPath,
+            parentId: currentParentId,
+            depth: (parentNode?.depth ?? 0) + 1,
+            childFolderIds: new Set(),
+            childFileIds: new Set(),
+            otherFileCount: 0,
+          };
+          inventory.folderById.set(folderId, newNode);
+          parentNode?.childFolderIds.add(folderId);
+        }
+      }
+      currentParentId = folderId;
+    }
+
+    return currentParentId;
+  };
+
+  let uploaded = 0;
+  let deleted = 0;
+  let deletedFolders = 0;
+
+  // 1. Add new files & PATCH modified files
   for (let i = 0; i < plan.toUpload.length; i++) {
     const item = plan.toUpload[i];
     const {doc} = item;
     if (!doc.handle) continue;
 
     onProgress?.({
+      phase: 'upload',
       current: i + 1,
       total: plan.toUpload.length,
       fileName: doc.name,
     });
 
-    let subjectId = folderCache.get(`S:${doc.subject}`);
-    if (!subjectId) {
-      subjectId = await findOrCreateDriveFolder(accessToken, doc.subject, rootFolderId);
-      folderCache.set(`S:${doc.subject}`, subjectId);
-    }
-
-    const profKey = `P:${doc.subject}/${doc.professor}`;
-    let profId = folderCache.get(profKey);
-    if (!profId) {
-      profId = await findOrCreateDriveFolder(accessToken, doc.professor, subjectId);
-      folderCache.set(profKey, profId);
-    }
+    const segments = doc.relativePath.split('/').filter(Boolean);
+    const folderSegments = segments.slice(0, -1);
+    const parentFolderId = await ensureDriveFolderChain(folderSegments);
 
     const file = await doc.handle.getFile();
-    let targetId = item.existingDriveFileId;
+    let targetId =
+      item.existingDriveFileId ?? inventory?.filesByPath.get(doc.relativePath)?.id;
 
     if (!targetId) {
-      const remoteExisting = await findExistingDriveFileInFolder(accessToken, doc.name, profId);
+      const remoteExisting = await findExistingDriveFileInFolder(
+        accessToken,
+        doc.name,
+        parentFolderId
+      );
       if (remoteExisting) {
-        if (
-          remoteExisting.size &&
-          Number(remoteExisting.size) === file.size &&
-          item.action === 'new'
-        ) {
-          syncCache[doc.relativePath] = {
-            driveFileId: remoteExisting.id,
-            size: file.size,
-            lastModified: file.lastModified,
-            syncedAt: Date.now(),
-          };
-          saveDriveSyncCache(syncCache);
-          skippedExisting++;
-          continue;
-        }
         targetId = remoteExisting.id;
       }
     }
 
-    const driveFileId = await uploadOrUpdateDriveBlob(
+    const result = await uploadOrUpdateDriveBlob(
       accessToken,
       doc.name,
       file,
-      profId,
+      parentFolderId,
       targetId
     );
+
+    if (inventory) {
+      inventory.folderById.get(parentFolderId)?.childFileIds.add(result.id);
+    }
+
     syncCache[doc.relativePath] = {
-      driveFileId,
+      driveFileId: result.id,
       size: file.size,
       lastModified: file.lastModified,
       syncedAt: Date.now(),
@@ -626,30 +1013,87 @@ export async function executeDriveBackup(
     uploaded++;
   }
 
-  // Upload or update lightweight `search_index.json` at root of `Sauvegarde_Cours`
+  // 2. Delete obsolete files on Drive
+  if (deleteObsolete && plan.toDelete.length > 0) {
+    for (let i = 0; i < plan.toDelete.length; i++) {
+      const item = plan.toDelete[i];
+      onProgress?.({
+        phase: 'delete',
+        current: i + 1,
+        total: plan.toDelete.length,
+        fileName: item.name,
+      });
+
+      await deleteDriveFileOrFolder(accessToken, item.driveFileId);
+
+      if (syncCache[item.relativePath]?.driveFileId === item.driveFileId) {
+        delete syncCache[item.relativePath];
+        saveDriveSyncCache(syncCache);
+      }
+
+      if (inventory) {
+        inventory.folderById.get(item.parentId)?.childFileIds.delete(item.driveFileId);
+      }
+      deleted++;
+    }
+  }
+
+  // 3. Clean up empty folders bottom-up on Drive
+  if (inventory) {
+    const candidateFolders = Array.from(inventory.folderById.values())
+      .filter((f) => f.depth > 0)
+      .sort((a, b) => b.depth - a.depth);
+
+    const emptyFolders: RemoteDriveFolderNode[] = [];
+    for (const folder of candidateFolders) {
+      if (
+        folder.childFileIds.size === 0 &&
+        folder.childFolderIds.size === 0 &&
+        folder.otherFileCount === 0
+      ) {
+        emptyFolders.push(folder);
+        inventory.folderById.get(folder.parentId)?.childFolderIds.delete(folder.id);
+      }
+    }
+
+    for (let i = 0; i < emptyFolders.length; i++) {
+      const folder = emptyFolders[i];
+      onProgress?.({
+        phase: 'cleanup',
+        current: i + 1,
+        total: emptyFolders.length,
+        fileName: folder.name,
+      });
+      await deleteDriveFileOrFolder(accessToken, folder.id);
+      deletedFolders++;
+    }
+  }
+
+  // 4. Upload or update `search_index.json` at root of `Sauvegarde_Cours`
   let indexUpdated = false;
   try {
     onProgress?.({
-      current: plan.toUpload.length,
-      total: plan.toUpload.length,
+      phase: 'index',
+      current: 1,
+      total: 1,
       fileName: SEARCH_INDEX_FILENAME,
     });
     const payload = await exportSearchIndexForCloud();
-    if (payload.documents.length > 0) {
+    const existingIndexId =
+      inventory?.searchIndexFileId ??
+      (await findExistingDriveFileInFolder(accessToken, SEARCH_INDEX_FILENAME, rootFolderId))
+        ?.id;
+
+    if (payload.documents.length > 0 || existingIndexId) {
       const jsonBlob = new Blob([JSON.stringify(payload)], {
         type: 'application/json',
       });
-      const existingIndex = await findExistingDriveFileInFolder(
-        accessToken,
-        SEARCH_INDEX_FILENAME,
-        rootFolderId
-      );
       await uploadOrUpdateDriveBlob(
         accessToken,
         SEARCH_INDEX_FILENAME,
         jsonBlob,
         rootFolderId,
-        existingIndex?.id
+        existingIndexId
       );
       indexUpdated = true;
     }
@@ -657,120 +1101,92 @@ export async function executeDriveBackup(
     console.warn('Impossible de téléverser search_index.json:', err);
   }
 
-  return {uploaded, skippedExisting, indexUpdated};
+  return {uploaded, deleted, deletedFolders, indexUpdated};
 }
 
 /**
- * Reads `Sauvegarde_Cours / Matière / Professeur` directly from Google Drive API v3
- * without downloading any PDF binaries.
+ * Fetches only the `modifiedTime` metadata of a Drive file (`fields=modifiedTime`).
+ */
+export async function fetchDriveFileModifiedTime(
+  accessToken: string,
+  fileId: string,
+  signal?: AbortSignal
+): Promise<string | null> {
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
+      fileId
+    )}?fields=modifiedTime`,
+    {
+      headers: {Authorization: `Bearer ${accessToken}`},
+      signal,
+    }
+  );
+  if (res.status === 401) {
+    invalidateStoredAccessTokenKeepEmail();
+    throw new Error('Session Google expirée. Veuillez relancer l’action.');
+  }
+  if (res.status === 404) {
+    return null;
+  }
+  if (!res.ok) {
+    throw new Error(
+      `Impossible de vérifier les métadonnées Drive (${res.status}).`
+    );
+  }
+  const data = (await res.json()) as {modifiedTime?: string};
+  return data.modifiedTime ?? null;
+}
+
+/**
+ * Reads `Sauvegarde_Cours / ...` recursively from Google Drive API v3
+ * without downloading any document binaries.
  */
 export async function fetchCloudDriveLibrary(accessToken: string): Promise<{
   hasBackupFolder: boolean;
   documents: CourseDocument[];
   searchIndexFileId: string | null;
+  searchIndexModifiedTime: string | null;
 }> {
   const rootFolderId = await findDriveFolder(accessToken, ROOT_BACKUP_FOLDER_NAME);
   if (!rootFolderId) {
-    return {hasBackupFolder: false, documents: [], searchIndexFileId: null};
+    return {
+      hasBackupFolder: false,
+      documents: [],
+      searchIndexFileId: null,
+      searchIndexModifiedTime: null,
+    };
   }
 
-  const level1Entries = await listChildrenByParentIds(accessToken, [rootFolderId]);
-  const subjectFolders = level1Entries.filter(
-    (f) => f.mimeType === 'application/vnd.google-apps.folder'
-  );
-  const indexEntry = level1Entries.find((f) => f.name === SEARCH_INDEX_FILENAME) ?? null;
-
+  const inventory = await scanDriveBackupTree(accessToken, rootFolderId);
   const docs: CourseDocument[] = [];
 
-  for (const entry of level1Entries) {
-    if (entry.mimeType === 'application/vnd.google-apps.folder') continue;
-    const format = getCourseFileFormat(entry.name, entry.mimeType);
-    if (format) {
-      docs.push({
-        relativePath: entry.name,
-        name: entry.name,
-        format,
-        subject: 'à organiser',
-        professor: 'Racine',
-        size: Number(entry.size || 0),
-        lastModified: entry.modifiedTime ? Date.parse(entry.modifiedTime) : 0,
-        pageCount: 0,
-        source: 'cloud',
-        driveFileId: entry.id,
-        driveParentFolderId: rootFolderId,
-      });
-    }
-  }
-
-  const subjectMap = new Map<string, string>();
-  for (const s of subjectFolders) {
-    subjectMap.set(s.id, s.name);
-  }
-
-  const level2Entries = await listChildrenByParentIds(
-    accessToken,
-    subjectFolders.map((s) => s.id)
-  );
-  const professorFolders: Array<{id: string; name: string; subjectName: string}> = [];
-
-  for (const entry of level2Entries) {
-    const parentId = entry.parents?.[0];
-    const subjectName = (parentId && subjectMap.get(parentId)) || 'Matière';
-
-    if (entry.mimeType === 'application/vnd.google-apps.folder') {
-      professorFolders.push({id: entry.id, name: entry.name, subjectName});
-    } else {
-      const format = getCourseFileFormat(entry.name, entry.mimeType);
-      if (format) {
-        docs.push({
-          relativePath: `${subjectName}/${entry.name}`,
-          name: entry.name,
-          format,
-          subject: subjectName,
-          professor: 'Général',
-          size: Number(entry.size || 0),
-          lastModified: entry.modifiedTime ? Date.parse(entry.modifiedTime) : 0,
-          pageCount: 0,
-          source: 'cloud',
-          driveFileId: entry.id,
-          driveParentFolderId: parentId || rootFolderId,
-        });
-      }
-    }
-  }
-
-  const profMap = new Map<string, {name: string; subjectName: string}>();
-  for (const p of professorFolders) {
-    profMap.set(p.id, {name: p.name, subjectName: p.subjectName});
-  }
-
-  const level3Entries = await listChildrenByParentIds(
-    accessToken,
-    professorFolders.map((p) => p.id)
-  );
-
-  for (const entry of level3Entries) {
-    if (entry.mimeType === 'application/vnd.google-apps.folder') continue;
-    const format = getCourseFileFormat(entry.name, entry.mimeType);
+  for (const remote of inventory.filesByPath.values()) {
+    const format = getCourseFileFormat(remote.name, remote.mimeType);
     if (!format) continue;
 
-    const parentId = entry.parents?.[0];
-    const profInfo = parentId ? profMap.get(parentId) : undefined;
-    const subjectName = profInfo?.subjectName || 'Matière';
-    const professorName = profInfo?.name || 'Professeur';
+    const parts = remote.relativePath.split('/').filter(Boolean);
+    const dirSegments = parts.slice(0, -1);
+    const subject = dirSegments[0] ?? 'à organiser';
+    const professor =
+      dirSegments.length === 0
+        ? 'Racine'
+        : dirSegments.length === 1
+        ? 'Général'
+        : dirSegments.slice(1).join(' / ');
 
     docs.push({
-      relativePath: `${subjectName}/${professorName}/${entry.name}`,
-      name: entry.name,
+      relativePath: remote.relativePath,
+      name: remote.name,
       format,
-      subject: subjectName,
-      professor: professorName,
-      size: Number(entry.size || 0),
-      lastModified: entry.modifiedTime ? Date.parse(entry.modifiedTime) : 0,
+      subject,
+      professor,
+      size: remote.size,
+      lastModified: remote.modifiedTimeMs,
       pageCount: 0,
       source: 'cloud',
-      driveFileId: entry.id,
-      driveParentFolderId: parentId || rootFolderId,
+      driveFileId: remote.id,
+      driveParentFolderId: remote.parentId,
+      driveModifiedTime: remote.modifiedTime || undefined,
     });
   }
 
@@ -779,7 +1195,8 @@ export async function fetchCloudDriveLibrary(accessToken: string): Promise<{
   return {
     hasBackupFolder: true,
     documents: docs,
-    searchIndexFileId: indexEntry?.id ?? null,
+    searchIndexFileId: inventory.searchIndexFileId,
+    searchIndexModifiedTime: inventory.searchIndexModifiedTime,
   };
 }
 
@@ -807,7 +1224,7 @@ export async function downloadCloudSearchIndex(
 }
 
 /**
- * Fetches a single PDF on-demand into memory (`Uint8Array`) without writing anything locally.
+ * Fetches a single document on-demand into memory (`Uint8Array`) without writing to disk.
  */
 export async function fetchCloudPdfBytes(
   accessToken: string,
@@ -826,7 +1243,7 @@ export async function fetchCloudPdfBytes(
     throw new Error('Session Google expirée. Veuillez relancer l’ouverture du cours.');
   }
   if (!res.ok) {
-    throw new Error(`Impossible de récupérer ce PDF depuis Google Drive (${res.status}).`);
+    throw new Error(`Impossible de récupérer ce fichier depuis Google Drive (${res.status}).`);
   }
   const buffer = await res.arrayBuffer();
   return new Uint8Array(buffer);

@@ -1,6 +1,10 @@
 import React, {useEffect, useState} from 'react';
 import {Check, Copy, Database, KeyRound, LogOut, RefreshCw, Trash2, X} from 'lucide-react';
-import {clearCloudSearchIndex, getCloudSearchIndex, getIndexStats} from '../services/db';
+import {
+  clearAllOfflineCloudCache,
+  getCloudCacheStats,
+  getIndexStats,
+} from '../services/db';
 import {
   authenticateGoogleDrive,
   clearDriveSyncCache,
@@ -53,7 +57,11 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
     documentCount: 0,
     pageCount: 0,
   });
-  const [cloudIndexCount, setCloudIndexCount] = useState(0);
+  const [cloudCacheStats, setCloudCacheStats] = useState<{
+    cachedFileCount: number;
+    cachedBytes: number;
+    indexDocCount: number;
+  }>({cachedFileCount: 0, cachedBytes: 0, indexDocCount: 0});
 
   const currentOrigin =
     typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000';
@@ -66,8 +74,8 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
       setAuthStatus(null);
       setAuthError(null);
       getIndexStats().then(setStats).catch(() => {});
-      getCloudSearchIndex()
-        .then((idx) => setCloudIndexCount(idx?.documents.length ?? 0))
+      getCloudCacheStats()
+        .then(setCloudCacheStats)
         .catch(() => {});
     }
   }, [isOpen]);
@@ -302,7 +310,7 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
                 </h3>
               </div>
               <span className="font-mono tabular-nums text-xs text-slate-400">
-                Local : {stats.documentCount} ({stats.pageCount} p.) · Cloud : {cloudIndexCount}
+                Local : {stats.documentCount} ({stats.pageCount} p.) · Hors-ligne Cloud : {cloudCacheStats.cachedFileCount} cours ({(cloudCacheStats.cachedBytes / (1024 * 1024)).toFixed(1)} Mo) · Index : {cloudCacheStats.indexDocCount}
               </span>
             </div>
 
@@ -332,20 +340,27 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
                 <span>Vider l’index local</span>
               </button>
 
-              {cloudIndexCount > 0 && (
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await clearCloudSearchIndex();
-                    setCloudIndexCount(0);
-                    onCloudIndexCleared?.();
-                  }}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800 cursor-pointer"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  <span>Vider cache cloud</span>
-                </button>
-              )}
+              <button
+                type="button"
+                disabled={
+                  cloudCacheStats.cachedFileCount === 0 &&
+                  cloudCacheStats.indexDocCount === 0
+                }
+                onClick={async () => {
+                  await clearAllOfflineCloudCache();
+                  setCloudCacheStats({
+                    cachedFileCount: 0,
+                    cachedBytes: 0,
+                    indexDocCount: 0,
+                  });
+                  setAuthStatus('Cache hors-ligne (index et fichiers Cloud) vidé.');
+                  onCloudIndexCleared?.();
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-45 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Vider le cache hors-ligne</span>
+              </button>
             </div>
           </section>
 

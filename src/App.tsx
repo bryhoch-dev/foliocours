@@ -45,13 +45,16 @@ import {
 } from './services/parser';
 import {indexDocumentsQueue} from './services/pdfEngine';
 import {
+  analyzeDriveMirrorPlan,
   authenticateGoogleDrive,
-  buildDriveBackupPlan,
   downloadCloudSearchIndex,
-  executeDriveBackup,
+  executeDriveMirrorSync,
   fetchCloudDriveLibrary,
+  fetchDriveFileModifiedTime,
   getMemoryAccessToken,
   getSavedDriveClientId,
+  type DriveMirrorAnalysisResult,
+  type DriveMirrorProgress,
 } from './services/googleDrive';
 import {TopBar} from './components/TopBar';
 import {FolderTreePanel} from './components/FolderTreePanel';
@@ -130,15 +133,15 @@ export default function App() {
   const [renameTarget, setRenameTarget] = useState<RenameFolderTarget | null>(null);
   const [isRenamingFolder, setIsRenamingFolder] = useState(false);
 
-  // Google Drive Backup State
+  // Google Drive Mirror Sync State
   const [driveBackupModalOpen, setDriveBackupModalOpen] = useState(false);
   const [driveBackupPlan, setDriveBackupPlan] = useState<DriveBackupPlan | null>(null);
+  const [driveMirrorAnalysis, setDriveMirrorAnalysis] =
+    useState<DriveMirrorAnalysisResult | null>(null);
+  const [isAnalyzingDrive, setIsAnalyzingDrive] = useState(false);
   const [isUploadingDrive, setIsUploadingDrive] = useState(false);
-  const [driveUploadProgress, setDriveUploadProgress] = useState<{
-    current: number;
-    total: number;
-    fileName: string;
-  } | null>(null);
+  const [driveUploadProgress, setDriveUploadProgress] =
+    useState<DriveMirrorProgress | null>(null);
   const [driveResultMessage, setDriveResultMessage] = useState<string | null>(null);
   const [driveErrorMessage, setDriveErrorMessage] = useState<string | null>(null);
 
@@ -262,34 +265,69 @@ export default function App() {
         setIsCloudConnected(true);
         if (detectInitialMode() === 'cloud') {
           void fetchCloudDriveLibrary(restoredToken)
-            .then(async ({hasBackupFolder: folderExists, documents: remoteDocs, searchIndexFileId}) => {
-              if (!mounted) return;
-              setHasBackupFolder(folderExists);
-              let idx = cachedIndexRef;
-              if (searchIndexFileId) {
-                try {
-                  idx = await downloadCloudSearchIndex(restoredToken, searchIndexFileId);
-                  await saveCloudSearchIndex(idx);
-                  if (mounted) setCloudIndex(idx);
-                } catch {
-                  // keep cached index if offline
+            .then(
+              async ({
+                hasBackupFolder: folderExists,
+                documents: remoteDocs,
+                searchIndexFileId,
+                searchIndexModifiedTime,
+              }) => {
+                if (!mounted) return;
+                setHasBackupFolder(folderExists);
+                let idx = cachedIndexRef;
+                if (searchIndexFileId) {
+                  try {
+                    const remoteModifiedTime =
+                      (await fetchDriveFileModifiedTime(
+                        restoredToken,
+                        searchIndexFileId
+                      )) ?? searchIndexModifiedTime;
+                    const cachedTs = idx?.driveModifiedTime
+                      ? Date.parse(idx.driveModifiedTime)
+                      : 0;
+                    const remoteTs = remoteModifiedTime
+                      ? Date.parse(remoteModifiedTime)
+                      : 0;
+                    const needsDownload =
+                      !idx ||
+                      !idx.driveModifiedTime ||
+                      (remoteTs > 0 && remoteTs > cachedTs) ||
+                      (!!remoteModifiedTime &&
+                        remoteModifiedTime !== idx.driveModifiedTime);
+
+                    if (needsDownload) {
+                      const downloaded = await downloadCloudSearchIndex(
+                        restoredToken,
+                        searchIndexFileId
+                      );
+                      idx = {
+                        ...downloaded,
+                        driveFileId: searchIndexFileId,
+                        driveModifiedTime: remoteModifiedTime ?? undefined,
+                      };
+                      await saveCloudSearchIndex(idx);
+                      if (mounted) setCloudIndex(idx);
+                    }
+                  } catch {
+                    // keep cached index if offline or metadata unchanged
+                  }
+                }
+                const pageCountMap = new Map<string, number>();
+                if (idx) {
+                  for (const d of idx.documents) {
+                    pageCountMap.set(d.relativePath, d.pageCount);
+                  }
+                }
+                if (mounted) {
+                  setCloudDocuments(
+                    remoteDocs.map((doc) => ({
+                      ...doc,
+                      pageCount: pageCountMap.get(doc.relativePath) ?? doc.pageCount,
+                    }))
+                  );
                 }
               }
-              const pageCountMap = new Map<string, number>();
-              if (idx) {
-                for (const d of idx.documents) {
-                  pageCountMap.set(d.relativePath, d.pageCount);
-                }
-              }
-              if (mounted) {
-                setCloudDocuments(
-                  remoteDocs.map((doc) => ({
-                    ...doc,
-                    pageCount: pageCountMap.get(doc.relativePath) ?? doc.pageCount,
-                  }))
-                );
-              }
-            })
+            )
             .catch(() => {
               // Silent startup restore failure must never pop up OAuth
               if (mounted && !getMemoryAccessToken()) {
@@ -408,15 +446,39 @@ export default function App() {
         hasBackupFolder: folderExists,
         documents: remoteDocs,
         searchIndexFileId,
+        searchIndexModifiedTime,
       } = libraryResult;
       setHasBackupFolder(folderExists);
 
       let latestIndex = cloudIndex;
+      let indexDownloadedFresh = false;
       if (searchIndexFileId) {
         try {
-          latestIndex = await downloadCloudSearchIndex(token, searchIndexFileId);
-          await saveCloudSearchIndex(latestIndex);
-          setCloudIndex(latestIndex);
+          const remoteModifiedTime =
+            (await fetchDriveFileModifiedTime(token, searchIndexFileId)) ??
+            searchIndexModifiedTime;
+          const cachedTs = latestIndex?.driveModifiedTime
+            ? Date.parse(latestIndex.driveModifiedTime)
+            : 0;
+          const remoteTs = remoteModifiedTime ? Date.parse(remoteModifiedTime) : 0;
+          const needsDownload =
+            !latestIndex ||
+            !latestIndex.driveModifiedTime ||
+            (remoteTs > 0 && remoteTs > cachedTs) ||
+            (!!remoteModifiedTime &&
+              remoteModifiedTime !== latestIndex.driveModifiedTime);
+
+          if (needsDownload) {
+            const downloaded = await downloadCloudSearchIndex(token, searchIndexFileId);
+            latestIndex = {
+              ...downloaded,
+              driveFileId: searchIndexFileId,
+              driveModifiedTime: remoteModifiedTime ?? undefined,
+            };
+            await saveCloudSearchIndex(latestIndex);
+            setCloudIndex(latestIndex);
+            indexDownloadedFresh = true;
+          }
         } catch (idxErr) {
           console.warn('Impossible de charger search_index.json:', idxErr);
         }
@@ -441,7 +503,11 @@ export default function App() {
       } else {
         showToast(
           `${enriched.length} cours chargés depuis Google Drive${
-            latestIndex ? ' (index recherche à jour)' : ''
+            latestIndex
+              ? indexDownloadedFresh
+                ? ' (index téléchargé)'
+                : ' (index en cache déjà à jour)'
+              : ''
           }.`
         );
       }
@@ -802,39 +868,104 @@ export default function App() {
     showToast('Format et règles d’alias enregistrés.');
   };
 
+  const runDriveMirrorAnalysis = useCallback(async () => {
+    const clientId = getSavedDriveClientId();
+    if (!clientId.trim()) return;
+
+    setIsAnalyzingDrive(true);
+    setDriveErrorMessage(null);
+    setDriveBackupPlan(null);
+    setDriveMirrorAnalysis(null);
+
+    try {
+      let token = await authenticateGoogleDrive(clientId);
+      setIsCloudConnected(true);
+      let analysis: DriveMirrorAnalysisResult;
+      try {
+        analysis = await analyzeDriveMirrorPlan(token, localDocuments);
+      } catch (err) {
+        if (
+          !getMemoryAccessToken() &&
+          err instanceof Error &&
+          err.message.includes('Session Google expirée')
+        ) {
+          token = await authenticateGoogleDrive(clientId);
+          analysis = await analyzeDriveMirrorPlan(token, localDocuments);
+        } else {
+          throw err;
+        }
+      }
+      setDriveMirrorAnalysis(analysis);
+      setDriveBackupPlan(analysis.plan);
+    } catch (err) {
+      setDriveErrorMessage(
+        err instanceof Error
+          ? err.message
+          : 'Impossible d’analyser la sauvegarde sur Google Drive.'
+      );
+    } finally {
+      setIsAnalyzingDrive(false);
+    }
+  }, [localDocuments]);
+
   const handleTriggerDriveBackup = () => {
-    const plan = buildDriveBackupPlan(localDocuments);
-    setDriveBackupPlan(plan);
+    setDriveBackupPlan(null);
+    setDriveMirrorAnalysis(null);
     setDriveResultMessage(null);
     setDriveErrorMessage(null);
     setDriveUploadProgress(null);
     setDriveBackupModalOpen(true);
+    void runDriveMirrorAnalysis();
   };
 
   const handleConfirmDriveUpload = async () => {
-    if (!driveBackupPlan) return;
+    if (!driveMirrorAnalysis) return;
     const clientId = getSavedDriveClientId();
     setIsUploadingDrive(true);
     setDriveErrorMessage(null);
 
     try {
-      const token = await authenticateGoogleDrive(clientId);
+      let token = await authenticateGoogleDrive(clientId);
       setIsCloudConnected(true);
-      const {uploaded, skippedExisting, indexUpdated} = await executeDriveBackup(
-        token,
-        driveBackupPlan,
-        setDriveUploadProgress
-      );
-      setDriveResultMessage(
-        `${uploaded} fichier${uploaded > 1 ? 's' : ''} téléversé${uploaded > 1 ? 's' : ''} dans Sauvegarde_Cours${
-          skippedExisting > 0
-            ? ` (${skippedExisting} déjà présent${skippedExisting > 1 ? 's' : ''})`
-            : ''
-        }${indexUpdated ? ' · search_index.json mis à jour' : ''}.`
-      );
+
+      let syncRes;
+      try {
+        syncRes = await executeDriveMirrorSync(token, driveMirrorAnalysis, {
+          deleteObsolete: true,
+          onProgress: setDriveUploadProgress,
+        });
+      } catch (err) {
+        if (
+          !getMemoryAccessToken() &&
+          err instanceof Error &&
+          err.message.includes('Session Google expirée')
+        ) {
+          token = await authenticateGoogleDrive(clientId);
+          syncRes = await executeDriveMirrorSync(token, driveMirrorAnalysis, {
+            deleteObsolete: true,
+            onProgress: setDriveUploadProgress,
+          });
+        } else {
+          throw err;
+        }
+      }
+
+      const folderSuffix =
+        syncRes.deletedFolders > 0
+          ? `, ${syncRes.deletedFolders} dossier${
+              syncRes.deletedFolders > 1 ? 's' : ''
+            } vide${syncRes.deletedFolders > 1 ? 's' : ''} nettoyé${
+              syncRes.deletedFolders > 1 ? 's' : ''
+            }`
+          : '';
+      const indexSuffix = syncRes.indexUpdated ? ' · search_index.json à jour' : '';
+      const summaryLine = `${syncRes.uploaded} ajoutés/mis à jour, ${syncRes.deleted} supprimés sur Drive`;
+
+      setDriveResultMessage(`${summaryLine}${folderSuffix}${indexSuffix}.`);
+      showToast(summaryLine);
     } catch (err) {
       setDriveErrorMessage(
-        err instanceof Error ? err.message : 'Échec de la sauvegarde sur Google Drive.'
+        err instanceof Error ? err.message : 'Échec de la synchronisation Google Drive.'
       );
     } finally {
       setIsUploadingDrive(false);
@@ -977,7 +1108,7 @@ export default function App() {
         onTriggerDriveBackup={handleTriggerDriveBackup}
         onCloudIndexCleared={() => {
           setCloudIndex(null);
-          showToast('Cache d’index mobile vidé.');
+          showToast('Cache hors-ligne vidé.');
         }}
       />
 
@@ -1034,7 +1165,7 @@ export default function App() {
         }}
         onCloudIndexCleared={() => {
           setCloudIndex(null);
-          showToast('Cache d’index cloud vidé.');
+          showToast('Cache hors-ligne vidé.');
         }}
         onCloudAuthChanged={(connected) => {
           setIsCloudConnected(connected);
@@ -1049,11 +1180,13 @@ export default function App() {
         isOpen={driveBackupModalOpen}
         plan={driveBackupPlan}
         hasClientId={!!getSavedDriveClientId().trim()}
+        isAnalyzing={isAnalyzingDrive}
         isUploading={isUploadingDrive}
         progress={driveUploadProgress}
         resultMessage={driveResultMessage}
         errorMessage={driveErrorMessage}
         onConfirmUpload={handleConfirmDriveUpload}
+        onRetryAnalyze={() => void runDriveMirrorAnalysis()}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
         onClose={() => setDriveBackupModalOpen(false)}
       />

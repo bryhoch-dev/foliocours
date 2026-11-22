@@ -28,7 +28,7 @@ import {
 } from '../services/parser';
 import {
   buildAccentInsensitiveRegex,
-  clearCloudSearchIndex,
+  clearAllOfflineCloudCache,
   searchCloudIndexPayload,
   searchIndexedLibrary,
 } from '../services/db';
@@ -840,32 +840,30 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
               </div>
             </div>
 
-            {/* Cloud Index Cache Status */}
+            {/* Cloud Offline Cache Status */}
             <div className="rounded-2xl border border-slate-800 bg-[#0F172A] p-4 space-y-2.5">
               <div className="flex items-center justify-between gap-2">
                 <h2 className="font-display text-sm font-semibold text-slate-100">
-                  Cache de recherche léger
+                  Cache hors-ligne (IndexedDB)
                 </h2>
                 <span className="font-mono tabular-nums text-xs text-slate-400">
-                  {cloudIndex ? `${cloudIndex.documents.length} PDF` : 'Vide'}
+                  {cloudIndex ? `${cloudIndex.documents.length} cours` : 'Vide'}
                 </span>
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Seul le texte indexé (<span className="font-mono text-slate-300">search_index.json</span>) est conservé en cache. Aucun PDF n’est stocké sur le téléphone.
+                L’index de recherche et les cours déjà ouverts sont mis en cache localement selon leur date de modification Drive pour économiser vos données mobiles.
               </p>
-              {cloudIndex && (
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await clearCloudSearchIndex();
-                    onCloudIndexCleared();
-                  }}
-                  className="inline-flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200 py-1 cursor-pointer"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  <span>Vider le cache d’index</span>
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={async () => {
+                  await clearAllOfflineCloudCache();
+                  onCloudIndexCleared();
+                }}
+                className="inline-flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200 py-1 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Vider le cache hors-ligne</span>
+              </button>
             </div>
 
             {/* PWA Install Card */}

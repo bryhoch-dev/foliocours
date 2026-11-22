@@ -16,6 +16,7 @@ export interface CourseDocument {
   handle?: FileSystemFileHandle;
   driveFileId?: string;
   driveParentFolderId?: string;
+  driveModifiedTime?: string;
 }
 
 export interface StoredDocumentMeta {
@@ -48,6 +49,8 @@ export interface CloudSearchIndexDocument {
 export interface CloudSearchIndexPayload {
   version: 1;
   generatedAt: number;
+  driveFileId?: string;
+  driveModifiedTime?: string;
   documents: CloudSearchIndexDocument[];
 }
 
@@ -122,8 +125,18 @@ export interface DriveBackupPlanItem {
   existingDriveFileId?: string;
 }
 
+export interface DriveDeletePlanItem {
+  driveFileId: string;
+  name: string;
+  relativePath: string;
+  size: number;
+  parentId: string;
+}
+
 export interface DriveBackupPlan {
+  rootFolderId: string | null;
   toUpload: DriveBackupPlanItem[];
+  toDelete: DriveDeletePlanItem[];
   unchangedCount: number;
   totalBytes: number;
 }
