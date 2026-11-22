@@ -1,0 +1,6 @@
+{
+  "name": "FolioCours",
+  "description": "Gestionnaire PWA basse consommation mémoire pour trier, indexer, lire et sauvegarder vos cours universitaires PDF.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
