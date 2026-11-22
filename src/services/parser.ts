@@ -234,14 +234,136 @@ function renderOutputTemplate(
   return cleaned || values.originalWithoutExt;
 }
 
+function hasTokenMatch(haystackNorm: string, needleNorm: string): boolean {
+  if (!haystackNorm || !needleNorm) return false;
+  if (haystackNorm === needleNorm) return true;
+  const escaped = escapeRegExp(needleNorm);
+  const tokenRegex = new RegExp(
+    `(?:^|[\\s._\\-/()\\[\\]])${escaped}(?:$|[\\s._\\-/()\\[\\]])`,
+    'i'
+  );
+  return tokenRegex.test(haystackNorm);
+}
+
 /**
- * Parses a course filename (.pdf, .docx, .odt) exclusively using the dynamic regex
- * generated from the user's editable TitleFormatSettings (no fixed/hardcoded rules).
+ * Synchronizes sort/alias rules in localStorage when a folder (subject or professor)
+ * is physically renamed from oldName -> newName:
+ * 1. If an existing rule already mapped to oldName, updates its destination to newName.
+ * 2. Otherwise creates a new alias rule mapping oldName -> newName.
+ */
+export function syncRulesOnFolderRename(params: {
+  targetType: 'subject' | 'professor';
+  oldName: string;
+  newName: string;
+  existingRules?: SortRule[];
+}): {
+  rules: SortRule[];
+  action: 'updated' | 'created' | 'noop';
+  updatedCount: number;
+  affectedRule: SortRule | null;
+} {
+  const oldClean = cleanSegment(params.oldName);
+  const newClean = cleanSegment(params.newName);
+  const current = params.existingRules ? [...params.existingRules] : loadSortRules();
+
+  if (!oldClean || !newClean || oldClean === newClean) {
+    return {rules: current, action: 'noop', updatedCount: 0, affectedRule: null};
+  }
+
+  const oldNorm = normalizeForMatch(oldClean);
+  let updatedCount = 0;
+  let firstAffected: SortRule | null = null;
+
+  const updatedRules = current.map((rule) => {
+    if (
+      params.targetType === 'subject' &&
+      (rule.matchTarget === 'subject' ||
+        rule.matchTarget === 'ue' ||
+        rule.matchTarget === 'any' ||
+        rule.matchTarget === 'filename') &&
+      rule.subject.trim() &&
+      normalizeForMatch(rule.subject) === oldNorm
+    ) {
+      updatedCount++;
+      const updated: SortRule = {...rule, subject: newClean};
+      if (!firstAffected) firstAffected = updated;
+      return updated;
+    }
+
+    if (
+      params.targetType === 'professor' &&
+      (rule.matchTarget === 'professor' ||
+        rule.matchTarget === 'any' ||
+        rule.matchTarget === 'filename') &&
+      rule.professor.trim() &&
+      normalizeForMatch(rule.professor) === oldNorm
+    ) {
+      updatedCount++;
+      const updated: SortRule = {...rule, professor: newClean};
+      if (!firstAffected) firstAffected = updated;
+      return updated;
+    }
+
+    return rule;
+  });
+
+  if (updatedCount > 0) {
+    saveSortRules(updatedRules);
+    return {
+      rules: updatedRules,
+      action: 'updated',
+      updatedCount,
+      affectedRule: firstAffected,
+    };
+  }
+
+  // No rule targeted oldName yet: check if an identical alias rule already exists
+  const alreadyExists = current.find(
+    (r) =>
+      r.matchTarget === params.targetType &&
+      normalizeForMatch(r.pattern) === oldNorm &&
+      normalizeForMatch(
+        params.targetType === 'subject' ? r.subject : r.professor
+      ) === normalizeForMatch(newClean)
+  );
+  if (alreadyExists) {
+    return {
+      rules: current,
+      action: 'noop',
+      updatedCount: 0,
+      affectedRule: alreadyExists,
+    };
+  }
+
+  const createdRule: SortRule = {
+    id: `alias-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    pattern: oldClean,
+    matchTarget: params.targetType,
+    subject: params.targetType === 'subject' ? newClean : '',
+    professor: params.targetType === 'professor' ? newClean : '',
+    enabled: true,
+  };
+
+  const nextRules = [...current, createdRule];
+  saveSortRules(nextRules);
+  return {
+    rules: nextRules,
+    action: 'created',
+    updatedCount: 0,
+    affectedRule: createdRule,
+  };
+}
+
+/**
+ * Parses a course filename (.pdf, .docx, .odt) using the dynamic regex
+ * generated from the user's editable TitleFormatSettings, then applies any
+ * user-defined or auto-created folder rename alias rules from localStorage.
  */
 export function parseCourseFilename(
   fileName: string,
   titleFormat: TitleFormatSettings = DEFAULT_TITLE_FORMAT_SETTINGS,
-  mimeType?: string
+  mimeType?: string,
+  rules?: SortRule[]
 ): {
   ueCode: string;
   subject: string;
@@ -278,9 +400,56 @@ export function parseCourseFilename(
     }
   }
 
-  const resolvedSubject = subject || 'Non classé';
-  const resolvedProfessor = professor || 'Professeur non précisé';
+  let resolvedSubject = subject || 'Non classé';
+  let resolvedProfessor = professor || 'Professeur non précisé';
   const resolvedTitle = rawTitle || cleanSegment(withoutExt);
+
+  const activeRules = rules ?? loadSortRules();
+  if (activeRules.length > 0) {
+    const normSubject = normalizeForMatch(resolvedSubject);
+    const normProfessor = normalizeForMatch(resolvedProfessor);
+    const normBase = normalizeForMatch(withoutExt);
+
+    let subjectApplied = false;
+    let professorApplied = false;
+
+    for (const rule of activeRules) {
+      if (!rule.enabled) continue;
+      const patternNorm = normalizeForMatch(rule.pattern);
+      if (!patternNorm) continue;
+
+      let matches = false;
+      if (rule.matchTarget === 'subject' || rule.matchTarget === 'ue') {
+        matches =
+          normSubject === patternNorm ||
+          (resolvedSubject === 'Non classé' && hasTokenMatch(normBase, patternNorm));
+      } else if (rule.matchTarget === 'professor') {
+        matches =
+          normProfessor === patternNorm ||
+          (resolvedProfessor === 'Professeur non précisé' &&
+            hasTokenMatch(normBase, patternNorm));
+      } else {
+        // 'any' | 'filename'
+        matches =
+          normSubject === patternNorm ||
+          normProfessor === patternNorm ||
+          hasTokenMatch(normBase, patternNorm);
+      }
+
+      if (!matches) continue;
+
+      if (!subjectApplied && rule.subject.trim()) {
+        resolvedSubject = cleanSegment(rule.subject);
+        subjectApplied = true;
+      }
+      if (!professorApplied && rule.professor.trim()) {
+        resolvedProfessor = cleanSegment(rule.professor);
+        professorApplied = true;
+      }
+
+      if (subjectApplied && professorApplied) break;
+    }
+  }
 
   const displayTitle = renderOutputTemplate(titleFormat.outputTemplate, {
     subject: resolvedSubject,
@@ -318,9 +487,19 @@ export function parseCourseFilename(
 export function formatCourseDisplayTitle(
   fileName: string,
   titleFormat: TitleFormatSettings,
-  overrides?: {subject?: string; professor?: string; mimeType?: string}
+  overrides?: {
+    subject?: string;
+    professor?: string;
+    mimeType?: string;
+    rules?: SortRule[];
+  }
 ): string {
-  const parsed = parseCourseFilename(fileName, titleFormat, overrides?.mimeType);
+  const parsed = parseCourseFilename(
+    fileName,
+    titleFormat,
+    overrides?.mimeType,
+    overrides?.rules
+  );
   const withoutExt = stripSupportedExtension(fileName);
 
   const subject =
@@ -347,12 +526,13 @@ export function formatCourseDisplayTitle(
 
 export function buildImportQueueItems(
   files: File[],
-  titleFormat: TitleFormatSettings = DEFAULT_TITLE_FORMAT_SETTINGS
+  titleFormat: TitleFormatSettings = DEFAULT_TITLE_FORMAT_SETTINGS,
+  rules?: SortRule[]
 ): ImportQueueItem[] {
   return files
     .filter((f) => isSupportedCourseFile(f))
     .map((file, index) => {
-      const parsed = parseCourseFilename(file.name, titleFormat, file.type);
+      const parsed = parseCourseFilename(file.name, titleFormat, file.type, rules);
       return {
         id: `${Date.now()}-${index}-${file.name}`,
         file,

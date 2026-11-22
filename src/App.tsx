@@ -7,6 +7,7 @@ import type {
   IndexingProgress,
   ImportQueueItem,
   SearchResult,
+  SortRule,
   TitleFormatSettings,
   WorkspaceTab,
 } from './types/course';
@@ -26,17 +27,22 @@ import {
   CLASSIFY_FOLDER_NAME,
   isFileSystemAccessSupported,
   isOrganizeRootFolderName,
+  loadLocalRootAbsolutePath,
   ORGANIZE_FOLDER_NAME,
   pickRootDirectory,
+  renameWorkspaceDirectory,
   scanOrganizePreviewItems,
   scanRootDirectory,
   sortEntireWorkspace,
   verifyDirectoryPermission,
 } from './services/filesystem';
 import {
+  loadSortRules,
   loadTitleFormatSettings,
   parseCourseFilename,
+  saveSortRules,
   saveTitleFormatSettings,
+  syncRulesOnFolderRename,
 } from './services/parser';
 import {indexDocumentsQueue} from './services/pdfEngine';
 import {
@@ -58,6 +64,7 @@ import {RulesEditorModal} from './components/RulesEditorModal';
 import {SettingsAndDriveModal} from './components/SettingsAndDriveModal';
 import {DriveBackupConfirmModal} from './components/DriveBackupConfirmModal';
 import {FlattenFolderModal} from './components/FlattenFolderModal';
+import {RenameFolderModal, type RenameFolderTarget} from './components/RenameFolderModal';
 import {OfflineIndicator} from './components/OfflineIndicator';
 
 function detectInitialMode(): AppMode {
@@ -94,9 +101,13 @@ export default function App() {
   const [readerJumpKey, setReaderJumpKey] = useState(0);
   const [highlightQuery, setHighlightQuery] = useState('');
 
-  // Import & Editable Title Format State
+  // Import, Rules & Editable Title Format State
+  const [rules, setRules] = useState<SortRule[]>(() => loadSortRules());
   const [titleFormat, setTitleFormat] = useState<TitleFormatSettings>(() =>
     loadTitleFormatSettings()
+  );
+  const [localRootAbsPath, setLocalRootAbsPath] = useState<string>(() =>
+    loadLocalRootAbsolutePath()
   );
   const [importQueue, setImportQueue] = useState<ImportQueueItem[]>([]);
   const [isWritingImport, setIsWritingImport] = useState(false);
@@ -120,6 +131,8 @@ export default function App() {
   const [isRulesModalOpen, setIsRulesModalOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [isFlattenModalOpen, setIsFlattenModalOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<RenameFolderTarget | null>(null);
+  const [isRenamingFolder, setIsRenamingFolder] = useState(false);
 
   // Google Drive Backup State
   const [driveBackupModalOpen, setDriveBackupModalOpen] = useState(false);
@@ -187,12 +200,13 @@ export default function App() {
   const refreshClassifyQueue = useCallback(
     async (
       handle: FileSystemDirectoryHandle,
-      activeFormat: TitleFormatSettings = titleFormat
+      activeFormat: TitleFormatSettings = titleFormat,
+      activeRules: SortRule[] = rules
     ) => {
       try {
         const scannedItems = await scanOrganizePreviewItems(
           handle,
-          (name, mime) => parseCourseFilename(name, activeFormat, mime)
+          (name, mime) => parseCourseFilename(name, activeFormat, mime, activeRules)
         );
         setImportQueue(
           scannedItems.map((item) => ({
@@ -204,11 +218,16 @@ export default function App() {
         console.warn(`Analyse de « ${ORGANIZE_FOLDER_NAME} » impossible:`, err);
       }
     },
-    [titleFormat]
+    [titleFormat, rules]
   );
 
   const loadDirectoryAndIndex = useCallback(
-    async (handle: FileSystemDirectoryHandle, forceReindex = false) => {
+    async (
+      handle: FileSystemDirectoryHandle,
+      forceReindex = false,
+      activeRules: SortRule[] = rules,
+      activeFormat: TitleFormatSettings = titleFormat
+    ) => {
       const indexedMap = await getAllIndexedDocuments();
       const scannedDocs = await scanRootDirectory(handle, indexedMap);
       const validPaths = new Set(scannedDocs.map((d) => d.relativePath));
@@ -220,10 +239,10 @@ export default function App() {
         return scannedDocs.find((d) => d.relativePath === prev.relativePath) ?? null;
       });
 
-      await refreshClassifyQueue(handle, titleFormat);
+      await refreshClassifyQueue(handle, activeFormat, activeRules);
       void runIndexing(scannedDocs, forceReindex);
     },
-    [refreshClassifyQueue, titleFormat, runIndexing]
+    [refreshClassifyQueue, titleFormat, rules, runIndexing]
   );
 
   // Restore saved local directory handle & cached cloud search index on startup
@@ -521,7 +540,7 @@ export default function App() {
 
   const handleRefreshClassifyQueue = async () => {
     if (!rootHandle || needsPermissionReconnect) return;
-    await refreshClassifyQueue(rootHandle, titleFormat);
+    await refreshClassifyQueue(rootHandle, titleFormat, rules);
     showToast(`Dossier « ${CLASSIFY_FOLDER_NAME} » rescanné.`);
   };
 
@@ -566,7 +585,7 @@ export default function App() {
 
       const result = await sortEntireWorkspace(
         rootHandle,
-        (name, mime) => parseCourseFilename(name, titleFormat, mime),
+        (name, mime) => parseCourseFilename(name, titleFormat, mime, rules),
         overridesMap
       );
 
@@ -635,15 +654,118 @@ export default function App() {
     }
   };
 
-  const handleSaveTitleFormat = (nextFormat: TitleFormatSettings) => {
-    setTitleFormat(nextFormat);
-    saveTitleFormatSettings(nextFormat);
+  const handleRenameFolder = async (
+    target: RenameFolderTarget,
+    newName: string
+  ) => {
+    if (!rootHandle || needsPermissionReconnect) {
+      throw new Error('Veuillez lier votre dossier local avant de renommer.');
+    }
+
+    setIsRenamingFolder(true);
+    try {
+      const renameRes = await renameWorkspaceDirectory(rootHandle, {
+        kind: target.kind,
+        subjectName: target.subjectName,
+        professorName: target.professorName,
+        newName,
+      });
+
+      if (renameRes.oldName === renameRes.newName) {
+        return;
+      }
+
+      const syncRes = syncRulesOnFolderRename({
+        targetType: target.kind,
+        oldName: renameRes.oldName,
+        newName: renameRes.newName,
+        existingRules: rules,
+      });
+      setRules(syncRes.rules);
+
+      if (target.kind === 'subject' && selectedSubject === renameRes.oldName) {
+        setSelectedSubject(renameRes.newName);
+      } else if (
+        target.kind === 'professor' &&
+        selectedSubject === target.subjectName &&
+        selectedProfessor
+      ) {
+        const parts = selectedProfessor.split(' / ');
+        if (parts[parts.length - 1] === renameRes.oldName) {
+          parts[parts.length - 1] = renameRes.newName;
+          setSelectedProfessor(parts.join(' / '));
+        }
+      }
+
+      // Preserve active document selection in reader across folder rename
+      if (activeDoc && activeDoc.source !== 'cloud') {
+        const oldPrefix =
+          target.kind === 'subject'
+            ? `${renameRes.oldName}/`
+            : `${target.subjectName}/${target.professorName?.replace(/ \/ /g, '/')}/`;
+        if (activeDoc.relativePath.startsWith(oldPrefix)) {
+          const newPrefix =
+            target.kind === 'subject'
+              ? `${renameRes.newName}/`
+              : (() => {
+                  const profSegs = (target.professorName ?? '').split(' / ');
+                  profSegs[profSegs.length - 1] = renameRes.newName;
+                  return `${target.subjectName}/${profSegs.join('/')}/`;
+                })();
+          const nextRelPath = `${newPrefix}${activeDoc.relativePath.slice(oldPrefix.length)}`;
+          setActiveDoc((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  relativePath: nextRelPath,
+                  subject:
+                    target.kind === 'subject' ? renameRes.newName : prev.subject,
+                  professor:
+                    target.kind === 'professor'
+                      ? (() => {
+                          const profSegs = (target.professorName ?? '').split(' / ');
+                          profSegs[profSegs.length - 1] = renameRes.newName;
+                          return profSegs.join(' / ');
+                        })()
+                      : prev.professor,
+                }
+              : prev
+          );
+        }
+      }
+
+      await loadDirectoryAndIndex(rootHandle, false, syncRes.rules, titleFormat);
+
+      const ruleMsg =
+        syncRes.action === 'updated'
+          ? `${syncRes.updatedCount} règle${
+              syncRes.updatedCount > 1 ? 's' : ''
+            } existante${syncRes.updatedCount > 1 ? 's' : ''} mise${
+              syncRes.updatedCount > 1 ? 's' : ''
+            } à jour vers « ${renameRes.newName} »`
+          : syncRes.action === 'created'
+          ? `nouvelle règle d’alias créée (${renameRes.oldName} → ${renameRes.newName})`
+          : 'règle d’alias conservée';
+
+      showToast(
+        `Dossier « ${renameRes.oldName} » renommé en « ${renameRes.newName} » · ${ruleMsg}.`
+      );
+    } finally {
+      setIsRenamingFolder(false);
+    }
+  };
+
+  const handleSaveRules = (nextRules: SortRule[]) => {
+    setRules(nextRules);
+    saveSortRules(nextRules);
     setImportQueue((prev) =>
       prev.map((item) => {
         if (item.status !== 'pending') return item;
         const reparsed = parseCourseFilename(
           item.originalName,
-          nextFormat
+          titleFormat,
+          undefined,
+          nextRules
         );
         return {
           ...item,
@@ -656,7 +778,32 @@ export default function App() {
         };
       })
     );
-    showToast('Format de tri et d’affichage enregistré.');
+  };
+
+  const handleSaveTitleFormat = (nextFormat: TitleFormatSettings) => {
+    setTitleFormat(nextFormat);
+    saveTitleFormatSettings(nextFormat);
+    setImportQueue((prev) =>
+      prev.map((item) => {
+        if (item.status !== 'pending') return item;
+        const reparsed = parseCourseFilename(
+          item.originalName,
+          nextFormat,
+          undefined,
+          rules
+        );
+        return {
+          ...item,
+          ueCode: reparsed.ueCode,
+          subject: reparsed.subject,
+          professor: reparsed.professor,
+          targetName: reparsed.targetName,
+          displayTitle: reparsed.displayTitle,
+          matchedRulePattern: undefined,
+        };
+      })
+    );
+    showToast('Format et règles d’alias enregistrés.');
   };
 
   const handleTriggerDriveBackup = () => {
@@ -738,6 +885,7 @@ export default function App() {
           activeDocPath={activeDoc?.relativePath ?? null}
           indexingProgress={indexingProgress}
           titleFormat={titleFormat}
+          rules={rules}
           onLinkRootFolder={handleLinkRootFolder}
           onReconnectRootFolder={handleReconnectRootFolder}
           onRefreshTree={() => void handleRefreshTree()}
@@ -749,6 +897,7 @@ export default function App() {
             setActiveTab('library');
           }}
           onOpenDocument={(doc) => handleOpenDocument(doc, 1, '')}
+          onRequestRenameFolder={(target) => setRenameTarget(target)}
         />
 
         <CenterWorkspace
@@ -790,6 +939,8 @@ export default function App() {
           jumpKey={readerJumpKey}
           highlightQuery={highlightQuery}
           titleFormat={titleFormat}
+          rules={rules}
+          localRootAbsPath={localRootAbsPath}
           onPageChange={setReaderPage}
           onNotify={showToast}
         />
@@ -857,8 +1008,10 @@ export default function App() {
 
       <RulesEditorModal
         isOpen={isRulesModalOpen}
+        rules={rules}
         titleFormat={titleFormat}
         sampleFilename={sampleFilename}
+        onSaveRules={handleSaveRules}
         onSaveTitleFormat={handleSaveTitleFormat}
         onClose={() => setIsRulesModalOpen(false)}
       />
@@ -866,8 +1019,11 @@ export default function App() {
       <SettingsAndDriveModal
         isOpen={isSettingsModalOpen}
         hasRootFolder={!!rootHandle && !needsPermissionReconnect}
+        rules={rules}
         titleFormat={titleFormat}
         sampleFilename={sampleFilename}
+        localRootAbsPath={localRootAbsPath}
+        onChangeLocalRootAbsPath={setLocalRootAbsPath}
         onChangeTitleFormat={handleSaveTitleFormat}
         onClose={() => setIsSettingsModalOpen(false)}
         onReindexAll={() => {
@@ -938,6 +1094,13 @@ export default function App() {
             }${keptPart}.`
           );
         }}
+      />
+
+      <RenameFolderModal
+        target={renameTarget}
+        isRenaming={isRenamingFolder}
+        onConfirm={handleRenameFolder}
+        onClose={() => setRenameTarget(null)}
       />
 
       {/* Non-intrusive toast */}

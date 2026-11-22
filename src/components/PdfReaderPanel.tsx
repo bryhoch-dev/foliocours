@@ -19,12 +19,17 @@ import {
 import type {
   CourseDocument,
   CourseFileFormat,
+  SortRule,
   TitleFormatSettings,
 } from '../types/course';
 import {
   DEFAULT_TITLE_FORMAT_SETTINGS,
   formatCourseDisplayTitle,
 } from '../services/parser';
+import {
+  buildMsWordOfficeUri,
+  loadLocalRootAbsolutePath,
+} from '../services/filesystem';
 import {
   DOCX_MIME,
   getCourseFileFormat,
@@ -57,6 +62,8 @@ interface PdfReaderPanelProps {
   jumpKey?: number;
   highlightQuery: string;
   titleFormat?: TitleFormatSettings;
+  rules?: SortRule[];
+  localRootAbsPath?: string;
   onPageChange: (page: number) => void;
   onCloseMobile?: () => void;
   onNotify?: (text: string, tone?: 'info' | 'error') => void;
@@ -402,6 +409,8 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   jumpKey,
   highlightQuery,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
+  rules,
+  localRootAbsPath,
   onPageChange,
   onCloseMobile,
   onNotify,
@@ -1115,10 +1124,34 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     }
   };
 
-  // Mode PC Local: open/download file with explicit official MIME type & exact file.name, then revoke RAM
+  // Mode PC Local: open original .docx directly in Word via ms-word: if root absolute path is configured,
+  // or trigger a clean download with official MIME type & exact file.name (.odt / fallback .docx / .pdf)
   const handleOpenInDefaultApp = async () => {
     if (!courseDoc || !courseDoc.handle) return;
     try {
+      const effectiveRootPath = (
+        localRootAbsPath ?? loadLocalRootAbsolutePath()
+      ).trim();
+
+      if (docFormat === 'docx' && effectiveRootPath) {
+        const msWordUri = buildMsWordOfficeUri(
+          effectiveRootPath,
+          courseDoc.relativePath
+        );
+        if (msWordUri) {
+          const protocolLink = window.document.createElement('a');
+          protocolLink.href = msWordUri;
+          protocolLink.style.display = 'none';
+          window.document.body.appendChild(protocolLink);
+          protocolLink.click();
+          window.document.body.removeChild(protocolLink);
+          onNotify?.(
+            `Ouverture directe dans Word : ${courseDoc.name}`
+          );
+          return;
+        }
+      }
+
       const file = await courseDoc.handle.getFile();
       const lowerName = file.name.toLowerCase();
       const forcedMime = lowerName.endsWith('.docx')
@@ -1280,6 +1313,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
               {formatCourseDisplayTitle(courseDoc.name, titleFormat, {
                 subject: courseDoc.subject,
                 professor: courseDoc.professor,
+                rules,
               })}
             </span>
             <span
@@ -1411,11 +1445,13 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
                 type="button"
                 onClick={handleOpenInDefaultApp}
                 disabled={isLoading || !!error}
-                title="Ouvrir dans l'application par défaut (Word, LibreOffice, lecteur système)"
+                title="Ouvrir dans l'appli par défaut (Word via ms-word: si chemin configuré, sinon téléchargement MIME officiel)"
+                aria-label="Ouvrir dans l'appli par défaut"
                 className="min-h-[34px] inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800/80 px-2.5 py-1 text-xs font-medium text-slate-200 hover:border-amber-500/50 hover:text-amber-300 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <ExternalLink className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                <span className="hidden sm:inline">Ouvrir</span>
+                <span className="hidden sm:inline xl:hidden">Ouvrir l’appli</span>
+                <span className="hidden xl:inline">Ouvrir dans l’appli par défaut</span>
               </button>
 
               <button

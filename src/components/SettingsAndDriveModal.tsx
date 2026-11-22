@@ -1,6 +1,10 @@
 import React, {useEffect, useState} from 'react';
-import {Check, Copy, Database, KeyRound, LogOut, RefreshCw, Trash2, X} from 'lucide-react';
+import {Check, Copy, Database, FolderOpen, KeyRound, LogOut, RefreshCw, Trash2, X} from 'lucide-react';
 import {clearCloudSearchIndex, getCloudSearchIndex, getIndexStats} from '../services/db';
+import {
+  loadLocalRootAbsolutePath,
+  saveLocalRootAbsolutePath,
+} from '../services/filesystem';
 import {
   authenticateGoogleDrive,
   clearDriveSyncCache,
@@ -10,7 +14,7 @@ import {
   getStoredDriveEmail,
   saveDriveClientId,
 } from '../services/googleDrive';
-import type {TitleFormatSettings} from '../types/course';
+import type {SortRule, TitleFormatSettings} from '../types/course';
 import {DEFAULT_TITLE_FORMAT_SETTINGS} from '../services/parser';
 import {CourseTitleFormatSection} from './CourseTitleFormatSection';
 import {PWAInstallButton} from './PWAInstallButton';
@@ -18,8 +22,11 @@ import {PWAInstallButton} from './PWAInstallButton';
 interface SettingsAndDriveModalProps {
   isOpen: boolean;
   hasRootFolder: boolean;
+  rules?: SortRule[];
   titleFormat?: TitleFormatSettings;
   sampleFilename?: string | null;
+  localRootAbsPath?: string;
+  onChangeLocalRootAbsPath?: (path: string) => void;
   onChangeTitleFormat?: (settings: TitleFormatSettings) => void;
   onClose: () => void;
   onReindexAll: () => void;
@@ -31,8 +38,11 @@ interface SettingsAndDriveModalProps {
 export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
   isOpen,
   hasRootFolder,
+  rules,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
   sampleFilename,
+  localRootAbsPath,
+  onChangeLocalRootAbsPath,
   onChangeTitleFormat,
   onClose,
   onReindexAll,
@@ -41,6 +51,10 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
   onCloudAuthChanged,
 }) => {
   const [clientId, setClientId] = useState(getSavedDriveClientId);
+  const [absPathDraft, setAbsPathDraft] = useState(
+    () => localRootAbsPath ?? loadLocalRootAbsolutePath()
+  );
+  const [absPathStatus, setAbsPathStatus] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState(() => !!getMemoryAccessToken());
   const [userEmail, setUserEmail] = useState(getStoredDriveEmail);
   const [authStatus, setAuthStatus] = useState<string | null>(null);
@@ -59,6 +73,8 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
   useEffect(() => {
     if (isOpen) {
       setClientId(getSavedDriveClientId());
+      setAbsPathDraft(localRootAbsPath ?? loadLocalRootAbsolutePath());
+      setAbsPathStatus(null);
       setIsConnected(!!getMemoryAccessToken());
       setUserEmail(getStoredDriveEmail());
       setAuthStatus(null);
@@ -68,7 +84,7 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
         .then((idx) => setCloudIndexCount(idx?.documents.length ?? 0))
         .catch(() => {});
     }
-  }, [isOpen]);
+  }, [isOpen, localRootAbsPath]);
 
   if (!isOpen) return null;
 
@@ -148,9 +164,63 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
                 value={titleFormat}
                 onChange={onChangeTitleFormat}
                 sampleFilename={sampleFilename}
+                rules={rules}
               />
             </div>
           )}
+
+          {/* Optional PC Root Absolute Path for direct Word ms-word: opening */}
+          <section className="pb-5 border-b border-slate-800 space-y-2.5">
+            <div className="flex items-center gap-2">
+              <FolderOpen className="w-4 h-4 text-amber-400" />
+              <h3 className="font-display text-sm font-semibold text-slate-100">
+                Ouverture externe des fichiers .docx et .odt (PC Local)
+              </h3>
+            </div>
+            <div className="space-y-1.5">
+              <label
+                htmlFor="foliocours-local-abs-path"
+                className="block text-xs text-slate-300"
+              >
+                Chemin absolu du dossier racine sur le PC (optionnel)
+              </label>
+              <div className="flex gap-2">
+                <input
+                  id="foliocours-local-abs-path"
+                  type="text"
+                  value={absPathDraft}
+                  onChange={(e) => {
+                    setAbsPathDraft(e.target.value);
+                    setAbsPathStatus(null);
+                  }}
+                  placeholder="C:\Users\Nom\Documents\Cours"
+                  className="flex-1 rounded-lg border border-slate-800 bg-[#0B1120] px-3 py-2 text-xs font-mono text-slate-100 placeholder:text-slate-600 focus:border-amber-500/60 focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    const saved = saveLocalRootAbsolutePath(absPathDraft);
+                    setAbsPathDraft(saved);
+                    onChangeLocalRootAbsPath?.(saved);
+                    setAbsPathStatus(
+                      saved
+                        ? 'Chemin racine enregistré pour ouverture directe dans Word.'
+                        : 'Chemin absolu effacé (téléchargement propre utilisé).'
+                    );
+                  }}
+                  className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-medium text-slate-200 hover:bg-slate-700 cursor-pointer shrink-0"
+                >
+                  Enregistrer
+                </button>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                Si ce chemin est renseigné, le bouton « Ouvrir dans l’appli par défaut » lance directement vos <span className="font-mono text-slate-300">.docx</span> originaux dans Word via <span className="font-mono text-slate-300">ms-word:ofe|u|file:///…</span> sans téléchargement. Les fichiers <span className="font-mono text-slate-300">.odt</span> (ou si le champ reste vide) utilisent un téléchargement propre avec type MIME officiel.
+              </p>
+              {absPathStatus && (
+                <p className="text-xs text-emerald-400">{absPathStatus}</p>
+              )}
+            </div>
+          </section>
 
           {/* Google Drive Client ID & OAuth Section */}
           <section className="space-y-3">

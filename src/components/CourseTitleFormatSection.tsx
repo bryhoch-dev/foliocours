@@ -1,6 +1,6 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {RotateCcw, Sparkles, Tag} from 'lucide-react';
-import type {TitleFormatSettings} from '../types/course';
+import type {SortRule, TitleFormatSettings} from '../types/course';
 import {
   DEFAULT_TITLE_FORMAT_SETTINGS,
   parseCourseFilename,
@@ -15,6 +15,7 @@ interface CourseTitleFormatSectionProps {
   value: TitleFormatSettings;
   onChange: (next: TitleFormatSettings) => void;
   sampleFilename?: string | null;
+  rules?: SortRule[];
 }
 
 const INPUT_TAGS = ['{Matière}', '{Prof}', '{Titre}', '{Ignorer}'] as const;
@@ -31,6 +32,7 @@ export const CourseTitleFormatSection: React.FC<CourseTitleFormatSectionProps> =
   value,
   onChange,
   sampleFilename,
+  rules,
 }) => {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const outputRef = useRef<HTMLInputElement | null>(null);
@@ -82,7 +84,7 @@ export const CourseTitleFormatSection: React.FC<CourseTitleFormatSectionProps> =
     testFilename.trim() || sampleFilename?.trim() || FALLBACK_SAMPLE;
 
   const preview = useMemo(() => {
-    const parsed = parseCourseFilename(activeSample, value);
+    const parsed = parseCourseFilename(activeSample, value, undefined, rules);
     const safeSubject = sanitizePathSegment(parsed.subject, 'Non classé');
     const safeProf = sanitizePathSegment(
       parsed.professor,
@@ -96,7 +98,7 @@ export const CourseTitleFormatSection: React.FC<CourseTitleFormatSectionProps> =
       safeProf,
       targetPath: `${safeSubject}/${safeProf}/${safeFile}`,
     };
-  }, [activeSample, value]);
+  }, [activeSample, value, rules]);
 
   return (
     <section className="space-y-4">

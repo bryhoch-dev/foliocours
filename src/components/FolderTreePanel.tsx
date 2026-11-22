@@ -6,12 +6,14 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  Pencil,
   RefreshCw,
 } from 'lucide-react';
 import type {
   AppMode,
   CourseDocument,
   IndexingProgress,
+  SortRule,
   SubjectGroup,
   TitleFormatSettings,
 } from '../types/course';
@@ -20,6 +22,7 @@ import {
   formatCourseDisplayTitle,
 } from '../services/parser';
 import {FileFormatBadge, FileFormatIcon} from './FileFormatBadge';
+import type {RenameFolderTarget} from './RenameFolderModal';
 
 interface FolderTreePanelProps {
   mode: AppMode;
@@ -41,7 +44,9 @@ interface FolderTreePanelProps {
   onOpenSettings: () => void;
   onSelectScope: (subject: string | null, professor: string | null) => void;
   onOpenDocument: (doc: CourseDocument) => void;
+  onRequestRenameFolder?: (target: RenameFolderTarget) => void;
   titleFormat?: TitleFormatSettings;
+  rules?: SortRule[];
 }
 
 export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
@@ -64,7 +69,9 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
   onOpenSettings,
   onSelectScope,
   onOpenDocument,
+  onRequestRenameFolder,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
+  rules,
 }) => {
   const [expandedSubjects, setExpandedSubjects] = useState<Set<string>>(() => new Set());
   const [expandedProfessors, setExpandedProfessors] = useState<Set<string>>(() => new Set());
@@ -86,6 +93,7 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
                     const display = formatCourseDisplayTitle(d.name, titleFormat, {
                       subject: d.subject,
                       professor: d.professor,
+                      rules,
                     });
                     return (
                       d.name.toLowerCase().includes(q) ||
@@ -102,7 +110,7 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
         };
       })
       .filter((s) => s.professors.length > 0);
-  }, [tree, treeFilter]);
+  }, [tree, treeFilter, titleFormat, rules]);
 
   const totalDocs = useMemo(
     () => tree.reduce((sum, s) => sum + s.totalCount, 0),
@@ -341,11 +349,18 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
             selectedSubject === subject.name;
           const isSubjectSelected =
             selectedSubject === subject.name && selectedProfessor === null;
+          const canRenameSubject =
+            mode === 'local' &&
+            isSourceReady &&
+            !!onRequestRenameFolder &&
+            subject.professors.some((p) =>
+              p.documents.some((d) => d.relativePath.startsWith(`${subject.name}/`))
+            );
 
           return (
             <div key={subject.name} className="space-y-0.5">
               <div
-                className={`flex items-center gap-1 rounded-md px-1.5 py-1.5 text-xs transition-colors ${
+                className={`group flex items-center gap-1 rounded-md px-1.5 py-1.5 text-xs transition-colors ${
                   isSubjectSelected
                     ? 'bg-slate-800/90 text-amber-300 font-medium'
                     : 'text-slate-200 hover:bg-slate-800/50'
@@ -379,6 +394,23 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
                     {subject.totalCount}
                   </span>
                 </button>
+                {canRenameSubject && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onRequestRenameFolder?.({
+                        kind: 'subject',
+                        subjectName: subject.name,
+                      });
+                    }}
+                    title={`Renommer « ${subject.name} »`}
+                    aria-label={`Renommer le dossier ${subject.name}`}
+                    className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 p-1 rounded text-slate-400 hover:text-amber-300 hover:bg-slate-700/70 transition-opacity cursor-pointer shrink-0"
+                  >
+                    <Pencil className="w-3 h-3" />
+                  </button>
+                )}
               </div>
 
               {isSubjectOpen && (
@@ -391,11 +423,20 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
                       (selectedSubject === subject.name && selectedProfessor === prof.name);
                     const isProfSelected =
                       selectedSubject === subject.name && selectedProfessor === prof.name;
+                    const expectedProfPrefix = `${subject.name}/${prof.name.replace(/ \/ /g, '/')}/`;
+                    const canRenameProf =
+                      mode === 'local' &&
+                      isSourceReady &&
+                      !!onRequestRenameFolder &&
+                      prof.name !== 'Racine' &&
+                      prof.documents.some((d) =>
+                        d.relativePath.startsWith(expectedProfPrefix)
+                      );
 
                     return (
                       <div key={profKey} className="space-y-0.5">
                         <div
-                          className={`flex items-center gap-1 rounded-md px-1.5 py-1 text-xs transition-colors ${
+                          className={`group flex items-center gap-1 rounded-md px-1.5 py-1 text-xs transition-colors ${
                             isProfSelected
                               ? 'bg-slate-800/90 text-amber-300 font-medium'
                               : 'text-slate-300 hover:bg-slate-800/50'
@@ -426,6 +467,24 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
                               {prof.documents.length}
                             </span>
                           </button>
+                          {canRenameProf && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onRequestRenameFolder?.({
+                                  kind: 'professor',
+                                  subjectName: subject.name,
+                                  professorName: prof.name,
+                                });
+                              }}
+                              title={`Renommer « ${prof.name} »`}
+                              aria-label={`Renommer le dossier ${prof.name}`}
+                              className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 p-1 rounded text-slate-400 hover:text-amber-300 hover:bg-slate-700/70 transition-opacity cursor-pointer shrink-0"
+                            >
+                              <Pencil className="w-3 h-3" />
+                            </button>
+                          )}
                         </div>
 
                         {isProfOpen && (
@@ -454,6 +513,7 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
                                       {formatCourseDisplayTitle(doc.name, titleFormat, {
                                         subject: doc.subject,
                                         professor: doc.professor,
+                                        rules,
                                       })}
                                     </span>
                                   </span>

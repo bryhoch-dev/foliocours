@@ -910,3 +910,252 @@ export async function sortEntireWorkspace(
     totalScannedCount: allFiles.length,
   };
 }
+
+export interface RenameFolderResult {
+  oldName: string;
+  newName: string;
+  movedFilesCount: number;
+}
+
+async function moveDirectoryContentsRecursive(
+  srcDir: FileSystemDirectoryHandle,
+  destDir: FileSystemDirectoryHandle
+): Promise<number> {
+  const entries: Array<[string, FileSystemHandle]> = [];
+  for await (const entry of srcDir.entries()) {
+    entries.push(entry);
+  }
+
+  const existingNamesLower = new Set<string>();
+  for await (const [existingName] of destDir.entries()) {
+    existingNamesLower.add(existingName.toLowerCase());
+  }
+
+  let movedCount = 0;
+
+  for (const [entryName, entryHandle] of entries) {
+    if (entryHandle.kind === 'file') {
+      await moveFileHandleWithDuplicateCheck(
+        entryHandle as FileSystemFileHandle,
+        srcDir,
+        entryName,
+        destDir,
+        entryName,
+        existingNamesLower
+      );
+      movedCount++;
+    } else if (entryHandle.kind === 'directory') {
+      const subSrc = entryHandle as FileSystemDirectoryHandle;
+      const subDest = await destDir.getDirectoryHandle(entryName, {create: true});
+      movedCount += await moveDirectoryContentsRecursive(subSrc, subDest);
+
+      let hasRemaining = false;
+      for await (const _ of subSrc.entries()) {
+        hasRemaining = true;
+        break;
+      }
+      if (!hasRemaining) {
+        await srcDir.removeEntry(entryName);
+      }
+    }
+  }
+
+  return movedCount;
+}
+
+/**
+ * Safely renames a Matière or Professeur folder on disk:
+ * 1. Creates the new folder via parentHandle.getDirectoryHandle(cleanedName, { create: true }).
+ * 2. Recursively moves all files and subfolders into the new folder.
+ * 3. Removes the old folder only once completely emptied.
+ * Handles case-only renames on case-insensitive filesystems (Windows/macOS) via a temporary folder.
+ */
+export async function renameWorkspaceDirectory(
+  rootHandle: FileSystemDirectoryHandle,
+  params: {
+    kind: 'subject' | 'professor';
+    subjectName: string;
+    professorName?: string;
+    newName: string;
+  }
+): Promise<RenameFolderResult> {
+  const granted = await verifyDirectoryPermission(rootHandle, true);
+  if (!granted) {
+    throw new Error('Permission en écriture requise sur le dossier racine.');
+  }
+
+  const safeNewName = sanitizePathSegment(params.newName, '');
+  if (!safeNewName) {
+    throw new Error('Le nouveau nom de dossier est invalide ou vide.');
+  }
+  if (isHiddenDotFolder(safeNewName)) {
+    throw new Error('Le nom du dossier ne peut pas commencer par un point.');
+  }
+
+  let parentHandle: FileSystemDirectoryHandle;
+  let oldName: string;
+
+  if (params.kind === 'subject') {
+    parentHandle = rootHandle;
+    oldName = params.subjectName;
+  } else {
+    let currentDir: FileSystemDirectoryHandle;
+    try {
+      currentDir = await rootHandle.getDirectoryHandle(params.subjectName, {
+        create: false,
+      });
+    } catch {
+      throw new Error(`Le dossier matière « ${params.subjectName} » est introuvable sur le disque.`);
+    }
+
+    const segments = (params.professorName ?? '')
+      .split(' / ')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (segments.length === 0) {
+      throw new Error('Dossier professeur cible non précisé.');
+    }
+
+    for (let i = 0; i < segments.length - 1; i++) {
+      try {
+        currentDir = await currentDir.getDirectoryHandle(segments[i], {
+          create: false,
+        });
+      } catch {
+        throw new Error(`Sous-dossier « ${segments[i]} » introuvable sur le disque.`);
+      }
+    }
+
+    parentHandle = currentDir;
+    oldName = segments[segments.length - 1];
+  }
+
+  if (safeNewName === oldName) {
+    return {oldName, newName: safeNewName, movedFilesCount: 0};
+  }
+
+  let oldDirHandle: FileSystemDirectoryHandle;
+  try {
+    oldDirHandle = await parentHandle.getDirectoryHandle(oldName, {create: false});
+  } catch {
+    throw new Error(`Le dossier « ${oldName} » est introuvable sur le disque.`);
+  }
+
+  const targetDirHandle = await parentHandle.getDirectoryHandle(safeNewName, {
+    create: true,
+  });
+
+  const isSameDir = await isSameDirectoryHandle(oldDirHandle, targetDirHandle);
+  let movedFilesCount = 0;
+
+  if (isSameDir) {
+    // Case-only rename on Windows/macOS case-insensitive filesystem: move through temp dir
+    const tmpName = `.foliocours_tmp_${Date.now()}`;
+    const tmpDir = await parentHandle.getDirectoryHandle(tmpName, {create: true});
+    movedFilesCount = await moveDirectoryContentsRecursive(oldDirHandle, tmpDir);
+
+    let oldHasRemaining = false;
+    for await (const _ of oldDirHandle.entries()) {
+      oldHasRemaining = true;
+      break;
+    }
+    if (!oldHasRemaining) {
+      await parentHandle.removeEntry(oldName);
+    }
+
+    const finalDir = await parentHandle.getDirectoryHandle(safeNewName, {
+      create: true,
+    });
+    await moveDirectoryContentsRecursive(tmpDir, finalDir);
+
+    let tmpHasRemaining = false;
+    for await (const _ of tmpDir.entries()) {
+      tmpHasRemaining = true;
+      break;
+    }
+    if (!tmpHasRemaining) {
+      await parentHandle.removeEntry(tmpName);
+    }
+  } else {
+    movedFilesCount = await moveDirectoryContentsRecursive(
+      oldDirHandle,
+      targetDirHandle
+    );
+
+    let oldHasRemaining = false;
+    for await (const _ of oldDirHandle.entries()) {
+      oldHasRemaining = true;
+      break;
+    }
+    if (!oldHasRemaining) {
+      await parentHandle.removeEntry(oldName);
+    }
+  }
+
+  return {
+    oldName,
+    newName: safeNewName,
+    movedFilesCount,
+  };
+}
+
+const LOCAL_ROOT_ABS_PATH_KEY = 'foliocours_local_root_abs_path';
+
+export function loadLocalRootAbsolutePath(): string {
+  try {
+    return localStorage.getItem(LOCAL_ROOT_ABS_PATH_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+export function saveLocalRootAbsolutePath(path: string): string {
+  const cleaned = path.trim().replace(/^["']|["']$/g, '');
+  try {
+    if (cleaned) {
+      localStorage.setItem(LOCAL_ROOT_ABS_PATH_KEY, cleaned);
+    } else {
+      localStorage.removeItem(LOCAL_ROOT_ABS_PATH_KEY);
+    }
+  } catch {
+    // ignore storage error
+  }
+  return cleaned;
+}
+
+export function buildMsWordOfficeUri(
+  rootAbsolutePath: string,
+  relativePath: string
+): string | null {
+  const cleanedRoot = rootAbsolutePath
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .replace(/^file:\/\/\/?/i, '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+
+  if (!cleanedRoot) return null;
+
+  const cleanedRel = relativePath
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '');
+
+  if (!cleanedRel) return null;
+
+  const combined = `${cleanedRoot}/${cleanedRel}`;
+  const encodedPath = combined
+    .split('/')
+    .filter((seg) => seg.length > 0)
+    .map((seg, idx) => {
+      // Preserve Windows drive letter such as "C:" without encoding ':'
+      if (idx === 0 && /^[A-Za-z]:$/.test(seg)) {
+        return seg;
+      }
+      return encodeURIComponent(seg);
+    })
+    .join('/');
+
+  return `ms-word:ofe|u|file:///${encodedPath}`;
+}

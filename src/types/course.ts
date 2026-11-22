@@ -62,7 +62,7 @@ export interface SubjectGroup {
   totalCount: number;
 }
 
-export type RuleMatchTarget = 'any' | 'ue' | 'professor' | 'filename';
+export type RuleMatchTarget = 'any' | 'ue' | 'subject' | 'professor' | 'filename';
 
 export interface SortRule {
   id: string;
