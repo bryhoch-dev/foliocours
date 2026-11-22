@@ -19,7 +19,6 @@ import {
 import type {
   CourseDocument,
   CourseFileFormat,
-  SortRule,
   TitleFormatSettings,
 } from '../types/course';
 import {
@@ -58,7 +57,6 @@ interface PdfReaderPanelProps {
   jumpKey?: number;
   highlightQuery: string;
   titleFormat?: TitleFormatSettings;
-  rules?: SortRule[];
   onPageChange: (page: number) => void;
   onCloseMobile?: () => void;
   onNotify?: (text: string, tone?: 'info' | 'error') => void;
@@ -404,7 +402,6 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   jumpKey,
   highlightQuery,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
-  rules = [],
   onPageChange,
   onCloseMobile,
   onNotify,
@@ -1261,46 +1258,49 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
           : 'flex-1 bg-[#070B14] flex flex-col min-w-0 min-h-0'
       }
     >
-      {/* Reader Toolbar */}
-      <div className="min-h-12 shrink-0 border-b border-slate-800/90 bg-[#0F172A] px-2.5 md:px-4 py-1.5 flex items-center justify-between gap-2 md:gap-3 pt-safe">
-        <div className="min-w-0 flex items-center gap-2 text-xs">
+      {/* Reader Toolbar — clean flex-wrap container with zero overlap */}
+      <div className="shrink-0 border-b border-slate-800/90 bg-[#0F172A] px-3 md:px-4 py-2 flex flex-wrap items-center justify-between gap-2 pt-safe">
+        <div className="min-w-0 flex-1 flex items-center gap-2 text-xs basis-[200px]">
           {onCloseMobile && !isFullscreen && (
             <button
               type="button"
               onClick={onCloseMobile}
               aria-label="Retour"
-              className="md:hidden min-h-[40px] min-w-[40px] -ml-1 inline-flex items-center justify-center rounded-lg text-amber-400 hover:bg-slate-800 shrink-0 cursor-pointer"
+              className="md:hidden min-h-[38px] min-w-[38px] -ml-1 inline-flex items-center justify-center rounded-lg text-amber-400 hover:bg-slate-800 shrink-0 cursor-pointer"
             >
               <ArrowLeft className="w-5 h-5" />
             </button>
           )}
           <FileFormatBadge fileName={courseDoc.name} format={docFormat} />
-          <div className="min-w-0">
+          <div className="min-w-0 flex-1">
             <span
-              className="font-semibold text-slate-100 truncate block max-w-[130px] sm:max-w-xs lg:max-w-sm"
+              className="font-semibold text-slate-100 truncate block"
               title={courseDoc.name}
             >
-              {formatCourseDisplayTitle(courseDoc.name, titleFormat, rules, {
+              {formatCourseDisplayTitle(courseDoc.name, titleFormat, {
                 subject: courseDoc.subject,
                 professor: courseDoc.professor,
               })}
             </span>
-            <span className="text-slate-400 truncate hidden lg:inline text-[11px]">
+            <span
+              className="text-slate-400 truncate block text-[11px]"
+              title={`${courseDoc.subject} / ${courseDoc.professor}`}
+            >
               {courseDoc.subject} / {courseDoc.professor}
             </span>
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5 md:gap-2 shrink-0 flex-wrap justify-end">
+        <div className="flex flex-wrap items-center gap-1.5 shrink-0 max-w-full justify-end">
           {/* Page navigation (for PDF) */}
           {docFormat === 'pdf' && (
-            <div className="flex items-center gap-0.5 md:gap-1 rounded-md border border-slate-800 bg-[#0B1120] px-1 py-0.5">
+            <div className="flex items-center gap-0.5 rounded-md border border-slate-800 bg-[#0B1120] px-1 py-0.5 shrink-0">
               <button
                 type="button"
                 onClick={() => scrollToPage(currentPage - 1, 'smooth')}
                 disabled={currentPage <= 1 || numPages === 0}
                 aria-label="Page précédente"
-                className="min-h-[34px] min-w-[28px] flex items-center justify-center text-slate-400 hover:text-slate-100 disabled:opacity-35 cursor-pointer"
+                className="min-h-[30px] min-w-[26px] flex items-center justify-center text-slate-400 hover:text-slate-100 disabled:opacity-35 cursor-pointer"
               >
                 <ChevronLeft className="w-4 h-4" />
               </button>
@@ -1317,7 +1317,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
                   }
                 }}
                 aria-label="Numéro de page"
-                className="w-8 md:w-10 bg-transparent text-center font-mono tabular-nums text-xs text-slate-100 focus:outline-none"
+                className="w-7 md:w-9 bg-transparent text-center font-mono tabular-nums text-xs text-slate-100 focus:outline-none"
               />
               <span className="font-mono tabular-nums text-[11px] text-slate-500 pr-1">
                 /{numPages || '—'}
@@ -1327,25 +1327,25 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
                 onClick={() => scrollToPage(currentPage + 1, 'smooth')}
                 disabled={currentPage >= numPages || numPages === 0}
                 aria-label="Page suivante"
-                className="min-h-[34px] min-w-[28px] flex items-center justify-center text-slate-400 hover:text-slate-100 disabled:opacity-35 cursor-pointer"
+                className="min-h-[30px] min-w-[26px] flex items-center justify-center text-slate-400 hover:text-slate-100 disabled:opacity-35 cursor-pointer"
               >
                 <ChevronRight className="w-4 h-4" />
               </button>
             </div>
           )}
 
-          {/* Zoom controls (- / % / + / Ajuster à la largeur) */}
-          <div className="flex items-center gap-0.5 rounded-md border border-slate-800 bg-[#0B1120] px-1 py-0.5">
+          {/* Zoom controls (- / % / + / Largeur) */}
+          <div className="flex items-center gap-0.5 rounded-md border border-slate-800 bg-[#0B1120] px-1 py-0.5 shrink-0">
             <button
               type="button"
               onClick={() => applyZoom(scaleRef.current - 0.15)}
               title="Zoom arrière"
               aria-label="Zoom arrière"
-              className="min-h-[34px] min-w-[28px] flex items-center justify-center text-slate-400 hover:text-slate-100 cursor-pointer"
+              className="min-h-[30px] min-w-[26px] flex items-center justify-center text-slate-400 hover:text-slate-100 cursor-pointer"
             >
               <ZoomOut className="w-3.5 h-3.5" />
             </button>
-            <span className="hidden sm:inline font-mono tabular-nums text-xs text-slate-300 w-10 text-center">
+            <span className="font-mono tabular-nums text-xs text-slate-300 px-1 text-center">
               {Math.round(scale * 100)}%
             </span>
             <button
@@ -1353,7 +1353,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
               onClick={() => applyZoom(scaleRef.current + 0.15)}
               title="Zoom avant"
               aria-label="Zoom avant"
-              className="min-h-[34px] min-w-[28px] flex items-center justify-center text-slate-400 hover:text-slate-100 cursor-pointer"
+              className="min-h-[30px] min-w-[26px] flex items-center justify-center text-slate-400 hover:text-slate-100 cursor-pointer"
             >
               <ZoomIn className="w-3.5 h-3.5" />
             </button>
@@ -1363,7 +1363,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
               disabled={!hasLoadedContent}
               title="Ajuster à la largeur"
               aria-label="Ajuster à la largeur"
-              className="min-h-[34px] inline-flex items-center gap-1 px-1.5 text-slate-400 hover:text-amber-300 disabled:opacity-35 cursor-pointer"
+              className="min-h-[30px] inline-flex items-center gap-1 px-1.5 text-slate-400 hover:text-amber-300 disabled:opacity-35 cursor-pointer whitespace-nowrap shrink-0"
             >
               <MoveHorizontal className="w-3.5 h-3.5" />
               <span className="hidden xl:inline text-[11px] font-medium">Largeur</span>
@@ -1376,18 +1376,18 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
             onClick={() => void handleToggleFullscreen()}
             title={isFullscreen ? 'Quitter le plein écran (Échap)' : 'Plein écran'}
             aria-label={isFullscreen ? 'Quitter le plein écran' : 'Plein écran'}
-            className={`min-h-[36px] min-w-[36px] inline-flex items-center justify-center gap-1.5 rounded-md border px-2 py-1 text-xs font-medium transition-colors shrink-0 cursor-pointer ${
+            className={`min-h-[34px] inline-flex items-center justify-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
               isFullscreen
                 ? 'border-amber-500/60 bg-amber-500/15 text-amber-300'
                 : 'border-slate-700 bg-slate-800/80 text-slate-200 hover:border-amber-500/50 hover:text-amber-300'
             }`}
           >
             {isFullscreen ? (
-              <Minimize2 className="w-3.5 h-3.5" />
+              <Minimize2 className="w-3.5 h-3.5 shrink-0" />
             ) : (
-              <Maximize2 className="w-3.5 h-3.5" />
+              <Maximize2 className="w-3.5 h-3.5 shrink-0" />
             )}
-            <span className="hidden 2xl:inline">
+            <span className="hidden lg:inline">
               {isFullscreen ? 'Réduire' : 'Plein écran'}
             </span>
           </button>
@@ -1399,44 +1399,41 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
               target="_blank"
               rel="noopener noreferrer"
               title="Ouvrir le dossier parent sur Google Drive"
-              className="min-h-[36px] inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800/80 px-2.5 py-1 text-xs font-medium text-slate-200 hover:border-amber-500/50 hover:text-amber-300 transition-colors whitespace-nowrap shrink-0"
+              className="min-h-[34px] inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800/80 px-2.5 py-1 text-xs font-medium text-slate-200 hover:border-amber-500/50 hover:text-amber-300 transition-colors whitespace-nowrap shrink-0"
             >
               <FolderOpen className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-              <span className="hidden sm:inline">Ouvrir le dossier Drive</span>
+              <span className="hidden sm:inline">Ouvrir dossier</span>
             </a>
           ) : (
             /* Local Mode: Open in default app + Copy relative path */
-            <div className="flex items-center gap-1.5 shrink-0">
+            <>
               <button
                 type="button"
                 onClick={handleOpenInDefaultApp}
                 disabled={isLoading || !!error}
                 title="Ouvrir dans l'application par défaut (Word, LibreOffice, lecteur système)"
-                className="min-h-[36px] inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800/80 px-2.5 py-1 text-xs font-medium text-slate-200 hover:border-amber-500/50 hover:text-amber-300 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                className="min-h-[34px] inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800/80 px-2.5 py-1 text-xs font-medium text-slate-200 hover:border-amber-500/50 hover:text-amber-300 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <ExternalLink className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                <span className="hidden sm:inline">Ouvrir dans l’appli par défaut</span>
+                <span className="hidden sm:inline">Ouvrir</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => void handleCopyRelativePath()}
                 title={`Copier le chemin relatif : ${courseDoc.relativePath}`}
-                className="min-h-[36px] inline-flex items-center gap-1.5 rounded-md border border-slate-800 bg-[#0B1120] px-2.5 py-1 text-xs text-slate-300 hover:border-amber-500/50 hover:text-amber-200 transition-colors shrink-0 cursor-pointer"
+                className="min-h-[34px] inline-flex items-center gap-1.5 rounded-md border border-slate-800 bg-[#0B1120] px-2.5 py-1 text-xs text-slate-300 hover:border-amber-500/50 hover:text-amber-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 {copiedPath ? (
                   <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                 ) : (
                   <Copy className="w-3.5 h-3.5 text-slate-400 shrink-0" />
                 )}
-                <span className="hidden 2xl:inline font-mono text-[11px] max-w-[180px] truncate">
-                  {copiedPath ? 'Chemin copié' : courseDoc.relativePath}
-                </span>
-                <span className="2xl:hidden hidden md:inline text-[11px]">
-                  {copiedPath ? 'Copié' : 'Copier le chemin'}
+                <span className="hidden md:inline text-[11px]">
+                  {copiedPath ? 'Copié' : 'Copier chemin'}
                 </span>
               </button>
-            </div>
+            </>
           )}
         </div>
       </div>

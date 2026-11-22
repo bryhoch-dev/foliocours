@@ -7,7 +7,6 @@ import type {
   IndexingProgress,
   ImportQueueItem,
   SearchResult,
-  SortRule,
   TitleFormatSettings,
   WorkspaceTab,
 } from './types/course';
@@ -29,17 +28,14 @@ import {
   isOrganizeRootFolderName,
   ORGANIZE_FOLDER_NAME,
   pickRootDirectory,
-  resolveOrganizeSubfolders,
-  scanClassifyFolderItems,
+  scanOrganizePreviewItems,
   scanRootDirectory,
-  sortClassifyFolderItems,
+  sortEntireWorkspace,
   verifyDirectoryPermission,
 } from './services/filesystem';
 import {
-  loadSortRules,
   loadTitleFormatSettings,
   parseCourseFilename,
-  saveSortRules,
   saveTitleFormatSettings,
 } from './services/parser';
 import {indexDocumentsQueue} from './services/pdfEngine';
@@ -98,12 +94,10 @@ export default function App() {
   const [readerJumpKey, setReaderJumpKey] = useState(0);
   const [highlightQuery, setHighlightQuery] = useState('');
 
-  // Import, Rules & Title Format State
-  const [rules, setRules] = useState<SortRule[]>(() => loadSortRules());
+  // Import & Editable Title Format State
   const [titleFormat, setTitleFormat] = useState<TitleFormatSettings>(() =>
     loadTitleFormatSettings()
   );
-  const [includeAlreadySorted, setIncludeAlreadySorted] = useState(true);
   const [importQueue, setImportQueue] = useState<ImportQueueItem[]>([]);
   const [isWritingImport, setIsWritingImport] = useState(false);
 
@@ -157,13 +151,13 @@ export default function App() {
 
   const activeDocuments = mode === 'cloud' ? cloudDocuments : localDocuments;
   const tree = useMemo(() => buildCourseTree(activeDocuments), [activeDocuments]);
-  const sampleOrganizeFilename = useMemo(
+  const sampleFilename = useMemo(
     () =>
-      importQueue.find((i) => i.isFromOrganize)?.originalName ??
       importQueue[0]?.originalName ??
-      localDocuments.find((d) => isOrganizeRootFolderName(d.subject))?.name ??
+      localDocuments[0]?.name ??
+      cloudDocuments[0]?.name ??
       null,
-    [importQueue, localDocuments]
+    [importQueue, localDocuments, cloudDocuments]
   );
 
   const runIndexing = useCallback(
@@ -193,14 +187,12 @@ export default function App() {
   const refreshClassifyQueue = useCallback(
     async (
       handle: FileSystemDirectoryHandle,
-      activeRules: SortRule[],
       activeFormat: TitleFormatSettings = titleFormat
     ) => {
       try {
-        const scannedItems = await scanClassifyFolderItems(
+        const scannedItems = await scanOrganizePreviewItems(
           handle,
-          (name, mime) => parseCourseFilename(name, activeRules, mime, activeFormat),
-          {includeAlreadySorted: false}
+          (name, mime) => parseCourseFilename(name, activeFormat, mime)
         );
         setImportQueue(
           scannedItems.map((item) => ({
@@ -217,12 +209,6 @@ export default function App() {
 
   const loadDirectoryAndIndex = useCallback(
     async (handle: FileSystemDirectoryHandle, forceReindex = false) => {
-      try {
-        await resolveOrganizeSubfolders(handle, true);
-      } catch {
-        // Ignore if directory is temporarily read-only until explicit reconnect
-      }
-
       const indexedMap = await getAllIndexedDocuments();
       const scannedDocs = await scanRootDirectory(handle, indexedMap);
       const validPaths = new Set(scannedDocs.map((d) => d.relativePath));
@@ -234,10 +220,10 @@ export default function App() {
         return scannedDocs.find((d) => d.relativePath === prev.relativePath) ?? null;
       });
 
-      await refreshClassifyQueue(handle, rules, titleFormat);
+      await refreshClassifyQueue(handle, titleFormat);
       void runIndexing(scannedDocs, forceReindex);
     },
-    [refreshClassifyQueue, rules, titleFormat, runIndexing]
+    [refreshClassifyQueue, titleFormat, runIndexing]
   );
 
   // Restore saved local directory handle & cached cloud search index on startup
@@ -535,7 +521,7 @@ export default function App() {
 
   const handleRefreshClassifyQueue = async () => {
     if (!rootHandle || needsPermissionReconnect) return;
-    await refreshClassifyQueue(rootHandle, rules, titleFormat);
+    await refreshClassifyQueue(rootHandle, titleFormat);
     showToast(`Dossier « ${CLASSIFY_FOLDER_NAME} » rescanné.`);
   };
 
@@ -548,7 +534,7 @@ export default function App() {
     );
   };
 
-  const handleSortClassifyFolder = async (useEditedQueue = false) => {
+  const handleSortWorkspace = async (useEditedQueue = false) => {
     if (!rootHandle || needsPermissionReconnect) {
       showToast('Veuillez lier votre dossier local avant de trier les fichiers.', 'error');
       return;
@@ -562,75 +548,50 @@ export default function App() {
 
     setIsWritingImport(true);
     try {
-      await resolveOrganizeSubfolders(rootHandle, true);
-
-      let itemsToSort: ImportQueueItem[];
+      let overridesMap:
+        | Map<string, {subject: string; professor: string; targetName: string}>
+        | undefined;
       if (useEditedQueue && importQueue.length > 0) {
-        const editedPending = importQueue.filter((i) => i.status !== 'done');
-        if (includeAlreadySorted) {
-          const allScanned = await scanClassifyFolderItems(
-            rootHandle,
-            (name, mime) => parseCourseFilename(name, rules, mime, titleFormat),
-            {includeAlreadySorted: true}
-          );
-          const alreadySortedOnly: ImportQueueItem[] = allScanned
-            .filter((i) => !i.isFromOrganize)
-            .map((item) => ({...item, status: 'pending' as const}));
-          itemsToSort = [...editedPending, ...alreadySortedOnly];
-        } else {
-          itemsToSort = editedPending;
+        overridesMap = new Map();
+        for (const q of importQueue) {
+          if (q.status !== 'done') {
+            overridesMap.set(q.id, {
+              subject: q.subject,
+              professor: q.professor,
+              targetName: q.targetName,
+            });
+          }
         }
-      } else {
-        const fresh = await scanClassifyFolderItems(
-          rootHandle,
-          (name, mime) => parseCourseFilename(name, rules, mime, titleFormat),
-          {includeAlreadySorted}
-        );
-        itemsToSort = fresh.map((item) => ({
-          ...item,
-          status: 'pending' as const,
-        }));
-        setImportQueue(
-          itemsToSort
-            .filter((i) => i.isFromOrganize !== false)
-        );
       }
 
-      if (itemsToSort.length === 0) {
-        showToast(
-          `Aucun fichier (.pdf, .docx, .odt) trouvé dans « ${CLASSIFY_FOLDER_NAME} »${
-            includeAlreadySorted ? ' ni dans les dossiers existants' : ''
-          }.`
-        );
-        return;
-      }
-
-      const result = await sortClassifyFolderItems(rootHandle, itemsToSort, {
-        cleanupEmptySortedFolders: includeAlreadySorted,
-        onItemStatus: (id, status, error) => {
-          setImportQueue((prev) =>
-            prev.map((q) => (q.id === id ? {...q, status, error} : q))
-          );
-        },
-      });
+      const result = await sortEntireWorkspace(
+        rootHandle,
+        (name, mime) => parseCourseFilename(name, titleFormat, mime),
+        overridesMap
+      );
 
       await loadDirectoryAndIndex(rootHandle);
 
       const {
-        newlyClassifiedCount,
-        relocatedSortedCount,
         movedCount,
         unchangedCount,
         renamedDuplicatesCount,
         deletedFoldersCount,
         failedCount,
+        totalScannedCount,
       } = result;
 
+      if (selectedSubject && isOrganizeRootFolderName(selectedSubject)) {
+        setSelectedSubject(null);
+        setSelectedProfessor(null);
+      }
+
+      if (totalScannedCount === 0 && deletedFoldersCount === 0) {
+        showToast('Aucun fichier (.pdf, .docx, .odt) trouvé dans l’espace de travail.');
+        return;
+      }
+
       if (movedCount > 0 || deletedFoldersCount > 0) {
-        if (selectedSubject && isOrganizeRootFolderName(selectedSubject)) {
-          setSelectedSubject(null);
-          setSelectedProfessor(null);
-        }
         const dupInfo =
           renamedDuplicatesCount > 0
             ? ` · ${renamedDuplicatesCount} doublon${
@@ -642,11 +603,9 @@ export default function App() {
             ? ` · ${failedCount} erreur${failedCount > 1 ? 's' : ''}`
             : '';
         showToast(
-          `Tri terminé : ${newlyClassifiedCount} nouveau${
-            newlyClassifiedCount > 1 ? 'x' : ''
-          } cours classé${newlyClassifiedCount > 1 ? 's' : ''}, ${relocatedSortedCount} cours déjà trié${
-            relocatedSortedCount > 1 ? 's' : ''
-          } déplacé${relocatedSortedCount > 1 ? 's' : ''}, ${deletedFoldersCount} dossier${
+          `Tri global terminé : ${movedCount} fichier${
+            movedCount > 1 ? 's' : ''
+          } déplacé${movedCount > 1 ? 's' : ''}, ${unchangedCount} déjà en place, ${deletedFoldersCount} dossier${
             deletedFoldersCount > 1 ? 's' : ''
           } vide${deletedFoldersCount > 1 ? 's' : ''} supprimé${
             deletedFoldersCount > 1 ? 's' : ''
@@ -668,40 +627,12 @@ export default function App() {
       showToast(
         err instanceof Error
           ? err.message
-          : `Impossible de trier le dossier « ${CLASSIFY_FOLDER_NAME} ».`,
+          : 'Impossible de trier l’espace de travail.',
         'error'
       );
     } finally {
       setIsWritingImport(false);
     }
-  };
-
-  const handleSaveRules = (nextRules: SortRule[]) => {
-    setRules(nextRules);
-    saveSortRules(nextRules);
-    setImportQueue((prev) =>
-      prev.map((item) => {
-        if (item.status !== 'pending') return item;
-        const reparsed = parseCourseFilename(
-          item.originalName,
-          nextRules,
-          undefined,
-          titleFormat
-        );
-        return {
-          ...item,
-          ueCode: reparsed.ueCode,
-          subject: reparsed.subject,
-          professor: reparsed.professor,
-          targetName: reparsed.targetName,
-          displayTitle: reparsed.displayTitle,
-          courseType: reparsed.courseType,
-          courseNumber: reparsed.courseNumber,
-          matchedRulePattern: reparsed.matchedRulePattern,
-        };
-      })
-    );
-    showToast('Règles et alias enregistrés.');
   };
 
   const handleSaveTitleFormat = (nextFormat: TitleFormatSettings) => {
@@ -712,8 +643,6 @@ export default function App() {
         if (item.status !== 'pending') return item;
         const reparsed = parseCourseFilename(
           item.originalName,
-          rules,
-          undefined,
           nextFormat
         );
         return {
@@ -723,13 +652,11 @@ export default function App() {
           professor: reparsed.professor,
           targetName: reparsed.targetName,
           displayTitle: reparsed.displayTitle,
-          courseType: reparsed.courseType,
-          courseNumber: reparsed.courseNumber,
-          matchedRulePattern: reparsed.matchedRulePattern,
+          matchedRulePattern: undefined,
         };
       })
     );
-    showToast('Format du titre de cours enregistré.');
+    showToast('Format de tri et d’affichage enregistré.');
   };
 
   const handleTriggerDriveBackup = () => {
@@ -781,7 +708,7 @@ export default function App() {
         onSelectTab={(tab) => {
           setActiveTab(tab);
           if (tab === 'import' && rootHandle && !needsPermissionReconnect) {
-            void refreshClassifyQueue(rootHandle, rules, titleFormat);
+            void refreshClassifyQueue(rootHandle, titleFormat);
           }
         }}
         onOpenSearch={() => setIsSearchModalOpen(true)}
@@ -811,7 +738,6 @@ export default function App() {
           activeDocPath={activeDoc?.relativePath ?? null}
           indexingProgress={indexingProgress}
           titleFormat={titleFormat}
-          rules={rules}
           onLinkRootFolder={handleLinkRootFolder}
           onReconnectRootFolder={handleReconnectRootFolder}
           onRefreshTree={() => void handleRefreshTree()}
@@ -840,16 +766,13 @@ export default function App() {
           searchQuery={searchQuery}
           searchResults={searchResults}
           isSearching={isSearching}
-          includeAlreadySorted={includeAlreadySorted}
-          onToggleIncludeAlreadySorted={setIncludeAlreadySorted}
           titleFormat={titleFormat}
-          rules={rules}
           onSelectTab={setActiveTab}
           onLinkRootFolder={handleLinkRootFolder}
           onConnectCloud={() => void handleConnectOrRefreshCloud()}
           onOpenDocument={handleOpenDocument}
           onSortClassifyFolder={(useEditedQueue) =>
-            void handleSortClassifyFolder(useEditedQueue)
+            void handleSortWorkspace(useEditedQueue)
           }
           onRefreshClassifyQueue={() => void handleRefreshClassifyQueue()}
           onUpdateQueueItem={handleUpdateQueueItem}
@@ -867,7 +790,6 @@ export default function App() {
           jumpKey={readerJumpKey}
           highlightQuery={highlightQuery}
           titleFormat={titleFormat}
-          rules={rules}
           onPageChange={setReaderPage}
           onNotify={showToast}
         />
@@ -892,7 +814,6 @@ export default function App() {
         readerJumpKey={readerJumpKey}
         highlightQuery={highlightQuery}
         titleFormat={titleFormat}
-        rules={rules}
         onPageChange={setReaderPage}
         onOpenDocument={handleOpenDocument}
         onCloseDocument={handleCloseDocument}
@@ -922,7 +843,6 @@ export default function App() {
         initialQuery={searchQuery}
         documents={activeDocuments}
         titleFormat={titleFormat}
-        rules={rules}
         onClose={() => setIsSearchModalOpen(false)}
         onSelectResult={(doc, page, query) => {
           setSearchQuery(query);
@@ -937,10 +857,8 @@ export default function App() {
 
       <RulesEditorModal
         isOpen={isRulesModalOpen}
-        rules={rules}
         titleFormat={titleFormat}
-        sampleOrganizeFilename={sampleOrganizeFilename}
-        onSaveRules={handleSaveRules}
+        sampleFilename={sampleFilename}
         onSaveTitleFormat={handleSaveTitleFormat}
         onClose={() => setIsRulesModalOpen(false)}
       />
@@ -948,9 +866,8 @@ export default function App() {
       <SettingsAndDriveModal
         isOpen={isSettingsModalOpen}
         hasRootFolder={!!rootHandle && !needsPermissionReconnect}
-        rules={rules}
         titleFormat={titleFormat}
-        sampleOrganizeFilename={sampleOrganizeFilename}
+        sampleFilename={sampleFilename}
         onChangeTitleFormat={handleSaveTitleFormat}
         onClose={() => setIsSettingsModalOpen(false)}
         onReindexAll={() => {

@@ -19,7 +19,6 @@ import type {
   CourseDocument,
   MobileTab,
   SearchResult,
-  SortRule,
   SubjectGroup,
   TitleFormatSettings,
 } from '../types/course';
@@ -72,7 +71,6 @@ interface MobileWorkspaceProps {
   onCloudIndexCleared: () => void;
   onNotify?: (text: string, tone?: 'info' | 'error') => void;
   titleFormat?: TitleFormatSettings;
-  rules?: SortRule[];
 }
 
 type MobileSortBy = 'name' | 'size' | 'recent';
@@ -135,7 +133,6 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
   onCloudIndexCleared,
   onNotify,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
-  rules = [],
 }) => {
   const [mobileTab, setMobileTab] = useState<MobileTab>('courses');
   const [selectedSubject, setSelectedSubject] = useState<string | null>(null);
@@ -209,7 +206,7 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
     if (fileFilter.trim()) {
       const q = fileFilter.toLowerCase();
       list = list.filter((d) => {
-        const display = formatCourseDisplayTitle(d.name, titleFormat, rules, {
+        const display = formatCourseDisplayTitle(d.name, titleFormat, {
           subject: d.subject,
           professor: d.professor,
         });
@@ -230,7 +227,7 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
       sorted.sort((a, b) => a.name.localeCompare(b.name, 'fr', {numeric: true}));
     }
     return sorted;
-  }, [documents, selectedSubject, selectedProfessor, fileFilter, sortBy, titleFormat, rules]);
+  }, [documents, selectedSubject, selectedProfessor, fileFilter, sortBy, titleFormat]);
 
   // Screen 3: Full-screen PDF Reader (hides bottom tab bar and frees RAM when closing)
   if (activeDoc) {
@@ -242,7 +239,6 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
           jumpKey={readerJumpKey}
           highlightQuery={highlightQuery}
           titleFormat={titleFormat}
-          rules={rules}
           onPageChange={onPageChange}
           onCloseMobile={onCloseDocument}
           onNotify={onNotify}
@@ -558,7 +554,7 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
                           <div className="min-w-0">
                             <div className="flex items-center gap-1.5 min-w-0">
                               <p className="text-sm font-medium text-slate-100 truncate">
-                                {formatCourseDisplayTitle(doc.name, titleFormat, rules, {
+                                {formatCourseDisplayTitle(doc.name, titleFormat, {
                                   subject: doc.subject,
                                   professor: doc.professor,
                                 })}
@@ -658,7 +654,7 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
                         <span className="flex items-center gap-1.5 min-w-0">
                           <FileFormatIcon fileName={hit.fileName} className="w-3.5 h-3.5 shrink-0" />
                           <span className="text-xs font-semibold text-amber-300 truncate">
-                            {formatCourseDisplayTitle(hit.fileName, titleFormat, rules, {
+                            {formatCourseDisplayTitle(hit.fileName, titleFormat, {
                               subject: hit.subject,
                               professor: hit.professor,
                             })}

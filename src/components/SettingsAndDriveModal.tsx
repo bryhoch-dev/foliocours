@@ -10,7 +10,7 @@ import {
   getStoredDriveEmail,
   saveDriveClientId,
 } from '../services/googleDrive';
-import type {SortRule, TitleFormatSettings} from '../types/course';
+import type {TitleFormatSettings} from '../types/course';
 import {DEFAULT_TITLE_FORMAT_SETTINGS} from '../services/parser';
 import {CourseTitleFormatSection} from './CourseTitleFormatSection';
 import {PWAInstallButton} from './PWAInstallButton';
@@ -18,9 +18,8 @@ import {PWAInstallButton} from './PWAInstallButton';
 interface SettingsAndDriveModalProps {
   isOpen: boolean;
   hasRootFolder: boolean;
-  rules?: SortRule[];
   titleFormat?: TitleFormatSettings;
-  sampleOrganizeFilename?: string | null;
+  sampleFilename?: string | null;
   onChangeTitleFormat?: (settings: TitleFormatSettings) => void;
   onClose: () => void;
   onReindexAll: () => void;
@@ -32,9 +31,8 @@ interface SettingsAndDriveModalProps {
 export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
   isOpen,
   hasRootFolder,
-  rules = [],
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
-  sampleOrganizeFilename,
+  sampleFilename,
   onChangeTitleFormat,
   onClose,
   onReindexAll,
@@ -131,7 +129,7 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
               Paramètres & Sauvegarde Google Drive
             </h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              Configuration OAuth 2.0 (Google Identity Services), index IndexedDB et PWA.
+              Format des titres, configuration OAuth 2.0 (Google Identity Services), index IndexedDB et PWA.
             </p>
           </div>
           <button
@@ -149,8 +147,7 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
               <CourseTitleFormatSection
                 value={titleFormat}
                 onChange={onChangeTitleFormat}
-                rules={rules}
-                sampleOrganizeFilename={sampleOrganizeFilename}
+                sampleFilename={sampleFilename}
               />
             </div>
           )}

@@ -12,7 +12,6 @@ import type {
   AppMode,
   CourseDocument,
   IndexingProgress,
-  SortRule,
   SubjectGroup,
   TitleFormatSettings,
 } from '../types/course';
@@ -43,7 +42,6 @@ interface FolderTreePanelProps {
   onSelectScope: (subject: string | null, professor: string | null) => void;
   onOpenDocument: (doc: CourseDocument) => void;
   titleFormat?: TitleFormatSettings;
-  rules?: SortRule[];
 }
 
 export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
@@ -67,7 +65,6 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
   onSelectScope,
   onOpenDocument,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
-  rules = [],
 }) => {
   const [expandedSubjects, setExpandedSubjects] = useState<Set<string>>(() => new Set());
   const [expandedProfessors, setExpandedProfessors] = useState<Set<string>>(() => new Set());
@@ -86,7 +83,7 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
               subjectMatch || profMatch
                 ? prof.documents
                 : prof.documents.filter((d) => {
-                    const display = formatCourseDisplayTitle(d.name, titleFormat, rules, {
+                    const display = formatCourseDisplayTitle(d.name, titleFormat, {
                       subject: d.subject,
                       professor: d.professor,
                     });
@@ -454,7 +451,7 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
                                       className="w-3 h-3 shrink-0"
                                     />
                                     <span className="truncate">
-                                      {formatCourseDisplayTitle(doc.name, titleFormat, rules, {
+                                      {formatCourseDisplayTitle(doc.name, titleFormat, {
                                         subject: doc.subject,
                                         professor: doc.professor,
                                       })}

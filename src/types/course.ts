@@ -73,12 +73,8 @@ export interface SortRule {
   enabled: boolean;
 }
 
-export type SeparatorPreset = '_' | '-' | ' - ' | 'custom';
-
 export interface TitleFormatSettings {
   inputTemplate: string;
-  separatorPreset: SeparatorPreset;
-  customSeparator: string;
   outputTemplate: string;
   renameOnDisk: boolean;
 }

@@ -5,7 +5,6 @@ import type {
   CloudSearchIndexPayload,
   CourseDocument,
   SearchResult,
-  SortRule,
   TitleFormatSettings,
 } from '../types/course';
 import {
@@ -26,7 +25,6 @@ interface GlobalSearchModalProps {
   initialQuery: string;
   documents: CourseDocument[];
   titleFormat?: TitleFormatSettings;
-  rules?: SortRule[];
   onClose: () => void;
   onSelectResult: (doc: CourseDocument, page: number, query: string) => void;
   onPinResultsToPanel: (query: string, results: SearchResult[]) => void;
@@ -67,7 +65,6 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
   initialQuery,
   documents,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
-  rules = [],
   onClose,
   onSelectResult,
   onPinResultsToPanel,
@@ -232,7 +229,7 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
                         className="text-xs font-semibold text-slate-100 truncate"
                         title={hit.fileName}
                       >
-                        {formatCourseDisplayTitle(hit.fileName, titleFormat, rules, {
+                        {formatCourseDisplayTitle(hit.fileName, titleFormat, {
                           subject: hit.subject,
                           professor: hit.professor,
                         })}

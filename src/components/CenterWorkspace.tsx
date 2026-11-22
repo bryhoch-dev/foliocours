@@ -12,7 +12,6 @@ import type {
   CourseDocument,
   ImportQueueItem,
   SearchResult,
-  SortRule,
   TitleFormatSettings,
   WorkspaceTab,
 } from '../types/course';
@@ -53,10 +52,7 @@ interface CenterWorkspaceProps {
   onSearchQueryChange: (q: string) => void;
   onOpenRules: () => void;
   onOpenFlattenModal: () => void;
-  includeAlreadySorted: boolean;
-  onToggleIncludeAlreadySorted: (checked: boolean) => void;
   titleFormat?: TitleFormatSettings;
-  rules?: SortRule[];
 }
 
 function formatBytes(bytes: number): string {
@@ -119,15 +115,12 @@ export const CenterWorkspace: React.FC<CenterWorkspaceProps> = ({
   onSearchQueryChange,
   onOpenRules,
   onOpenFlattenModal,
-  includeAlreadySorted,
-  onToggleIncludeAlreadySorted,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
-  rules = [],
 }) => {
   const [listFilter, setListFilter] = useState('');
 
   const getDisplayTitle = (doc: CourseDocument) =>
-    formatCourseDisplayTitle(doc.name, titleFormat, rules, {
+    formatCourseDisplayTitle(doc.name, titleFormat, {
       subject: doc.subject,
       professor: doc.professor,
     });
@@ -173,43 +166,32 @@ export const CenterWorkspace: React.FC<CenterWorkspaceProps> = ({
                 </p>
               </div>
               {mode === 'local' && hasRootFolder && !needsPermissionReconnect && (
-                <div className="flex flex-col items-end gap-1.5 shrink-0">
-                  <div className="flex items-center gap-1.5 flex-wrap justify-end">
-                    <button
-                      type="button"
-                      onClick={onOpenFlattenModal}
-                      title={`Récupérer et aplatir un dossier vers ${CLASSIFY_FOLDER_NAME}`}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:border-amber-500/50 hover:text-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                    >
-                      <FolderArchive className="w-3.5 h-3.5 text-amber-400" />
-                      <span>Importer / Aplatir un dossier</span>
-                    </button>
-                    <button
-                      type="button"
-                      disabled={isWritingImport}
-                      onClick={() => onSortClassifyFolder(false)}
-                      title={`Trier « ${CLASSIFY_FOLDER_NAME} » et réappliquer les règles`}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/15 px-2.5 py-1.5 text-xs font-semibold text-amber-300 hover:bg-amber-500/25 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                    >
-                      <FolderInput className="w-3.5 h-3.5 text-amber-400" />
-                      <span>
-                        {isWritingImport
-                          ? 'Tri en cours…'
-                          : pendingClassifyCount > 0
-                          ? `Trier (${pendingClassifyCount})`
-                          : 'Trier'}
-                      </span>
-                    </button>
-                  </div>
-                  <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={includeAlreadySorted}
-                      onChange={(e) => onToggleIncludeAlreadySorted(e.target.checked)}
-                      className="h-3.5 w-3.5 accent-amber-500 cursor-pointer"
-                    />
-                    <span>Inclure les dossiers déjà triés (réappliquer les règles)</span>
-                  </label>
+                <div className="flex items-center gap-1.5 flex-wrap shrink-0 justify-end">
+                  <button
+                    type="button"
+                    onClick={onOpenFlattenModal}
+                    title={`Récupérer et aplatir un dossier vers ${CLASSIFY_FOLDER_NAME}`}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:border-amber-500/50 hover:text-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <FolderArchive className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Importer / Aplatir un dossier</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isWritingImport}
+                    onClick={() => onSortClassifyFolder(false)}
+                    title="Trier récursivement tout l’espace de travail selon le format configuré et supprimer les dossiers vides"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/15 px-2.5 py-1.5 text-xs font-semibold text-amber-300 hover:bg-amber-500/25 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <FolderInput className="w-3.5 h-3.5 text-amber-400" />
+                    <span>
+                      {isWritingImport
+                        ? 'Tri en cours…'
+                        : pendingClassifyCount > 0
+                        ? `Trier (${pendingClassifyCount})`
+                        : 'Trier'}
+                    </span>
+                  </button>
                 </div>
               )}
             </div>
@@ -351,10 +333,10 @@ export const CenterWorkspace: React.FC<CenterWorkspaceProps> = ({
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
                 <h2 className="font-display text-sm font-semibold text-slate-100">
-                  Tri direct du dossier « {CLASSIFY_FOLDER_NAME} »
+                  Tri global & Fichiers dans « à organiser »
                 </h2>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  Format détecté : <span className="font-mono text-slate-300">UEX - Professeur - Ronéo n</span>
+                <p className="text-xs text-slate-400 mt-0.5 truncate">
+                  Modèle actif : <span className="font-mono text-slate-300">{titleFormat.inputTemplate}</span>
                 </p>
               </div>
               <div className="flex items-center gap-2 shrink-0">
@@ -363,7 +345,7 @@ export const CenterWorkspace: React.FC<CenterWorkspaceProps> = ({
                   onClick={onOpenRules}
                   className="text-xs text-amber-400 hover:text-amber-300 underline-offset-4 hover:underline whitespace-nowrap cursor-pointer"
                 >
-                  Règles et Alias
+                  Format de tri
                 </button>
               </div>
             </div>
@@ -520,41 +502,29 @@ export const CenterWorkspace: React.FC<CenterWorkspaceProps> = ({
           </div>
 
           {importQueue.length > 0 && (
-            <div className="p-3.5 border-t border-slate-800/80 bg-[#0F172A] space-y-2.5">
-              <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={includeAlreadySorted}
-                  onChange={(e) => onToggleIncludeAlreadySorted(e.target.checked)}
-                  className="h-3.5 w-3.5 accent-amber-500 cursor-pointer"
-                />
-                <span>Inclure les dossiers déjà triés (réappliquer les règles)</span>
-              </label>
-              <div className="flex items-center justify-between gap-2">
-                <button
-                  type="button"
-                  onClick={onRefreshClassifyQueue}
-                  disabled={isWritingImport}
-                  className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-50 transition-colors cursor-pointer"
-                >
-                  Rescanner
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onSortClassifyFolder(true)}
-                  disabled={
-                    !hasRootFolder ||
-                    needsPermissionReconnect ||
-                    isWritingImport ||
-                    pendingClassifyCount === 0
-                  }
-                  className="flex-1 rounded-lg bg-amber-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:opacity-45 disabled:cursor-not-allowed transition-colors cursor-pointer"
-                >
-                  {isWritingImport
-                    ? 'Déplacement des fichiers…'
-                    : `Trier "${CLASSIFY_FOLDER_NAME}" (${pendingClassifyCount})`}
-                </button>
-              </div>
+            <div className="p-3.5 border-t border-slate-800/80 bg-[#0F172A] flex items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={onRefreshClassifyQueue}
+                disabled={isWritingImport}
+                className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-50 transition-colors cursor-pointer"
+              >
+                Rescanner
+              </button>
+              <button
+                type="button"
+                onClick={() => onSortClassifyFolder(true)}
+                disabled={
+                  !hasRootFolder ||
+                  needsPermissionReconnect ||
+                  isWritingImport
+                }
+                className="flex-1 rounded-lg bg-amber-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:opacity-45 disabled:cursor-not-allowed transition-colors cursor-pointer"
+              >
+                {isWritingImport
+                  ? 'Tri global en cours…'
+                  : `Trier tout l’espace de travail (${pendingClassifyCount} à organiser)`}
+              </button>
             </div>
           )}
         </div>
@@ -624,7 +594,7 @@ export const CenterWorkspace: React.FC<CenterWorkspaceProps> = ({
                           className="text-xs font-semibold text-amber-300 truncate"
                           title={hit.fileName}
                         >
-                          {formatCourseDisplayTitle(hit.fileName, titleFormat, rules, {
+                          {formatCourseDisplayTitle(hit.fileName, titleFormat, {
                             subject: hit.subject,
                             professor: hit.professor,
                           })}
