@@ -31,8 +31,6 @@ import {
 import {
   DOCX_MIME,
   getCourseFileFormat,
-  ODT_MIME,
-  PDF_MIME,
 } from '../services/fileFormats';
 import {
   destroyPdfDocument,
@@ -1404,43 +1402,19 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     }
   };
 
-  // Clean external launch via official MIME Blob download & exact file.name (no ms-word: / file:///)
-  const handleOpenInDefaultApp = async () => {
-    if (!courseDoc || !courseDoc.handle) return;
-    try {
-      const file = await courseDoc.handle.getFile();
-      const lowerName = file.name.toLowerCase();
-      const forcedMime = lowerName.endsWith('.docx')
-        ? DOCX_MIME
-        : lowerName.endsWith('.odt')
-        ? ODT_MIME
-        : lowerName.endsWith('.pdf')
-        ? PDF_MIME
-        : docFormat === 'docx'
-        ? DOCX_MIME
-        : docFormat === 'odt'
-        ? ODT_MIME
-        : PDF_MIME;
+  // Launch local course file via custom system protocol cours://open?path=... (no Blob/download)
+  const handleOpenInDefaultApp = () => {
+    if (!courseDoc || courseDoc.source === 'cloud') return;
+    const relativePath = courseDoc.relativePath.replace(/^\/+/, '');
+    if (!relativePath) return;
 
-      const buffer = await file.arrayBuffer();
-      const blob = new Blob([buffer], {type: forcedMime});
-      const blobUrl = URL.createObjectURL(blob);
-
-      const link = window.document.createElement('a');
-      link.href = blobUrl;
-      link.download = file.name;
-      link.style.display = 'none';
-      window.document.body.appendChild(link);
-      link.click();
-      window.document.body.removeChild(link);
-
-      setTimeout(() => {
-        URL.revokeObjectURL(blobUrl);
-      }, 250);
-    } catch (err) {
-      console.error('Ouverture externe impossible:', err);
-      onNotify?.('Impossible d’ouvrir le fichier local.', 'error');
-    }
+    const protocolUrl = `cours://open?path=${encodeURIComponent(relativePath)}`;
+    const link = window.document.createElement('a');
+    link.href = protocolUrl;
+    link.style.display = 'none';
+    window.document.body.appendChild(link);
+    link.click();
+    window.document.body.removeChild(link);
   };
 
   const handleCopyRelativePath = async () => {
@@ -1701,7 +1675,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
                 type="button"
                 onClick={handleOpenInDefaultApp}
                 disabled={isLoading || !!error}
-                title="Ouvrir dans l'appli par défaut (téléchargement propre avec type MIME officiel)"
+                title={`Ouvrir dans l’appli par défaut (${courseDoc.relativePath})`}
                 aria-label="Ouvrir dans l'appli par défaut"
                 className="min-h-[34px] inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800/80 px-2.5 py-1 text-xs font-medium text-slate-200 hover:border-amber-500/50 hover:text-amber-300 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
