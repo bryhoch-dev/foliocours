@@ -1230,13 +1230,16 @@ export async function fetchCloudDriveLibrary(accessToken: string): Promise<{
 
     const parts = remote.relativePath.split('/').filter(Boolean);
     const dirSegments = parts.slice(0, -1);
-    const subject = dirSegments[0] ?? 'à organiser';
+    const subject =
+      dirSegments.length >= 2
+        ? dirSegments[dirSegments.length - 2]
+        : dirSegments[0] ?? 'à organiser';
     const professor =
       dirSegments.length === 0
         ? 'Racine'
         : dirSegments.length === 1
         ? 'Général'
-        : dirSegments.slice(1).join(' / ');
+        : dirSegments[dirSegments.length - 1];
 
     // Always use actual Drive file.name (`remote.name`), never parent folder name
     docs.push({

@@ -219,6 +219,7 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
         const display = formatCourseDisplayTitle(d.name, titleFormat, {
           subject: d.subject,
           professor: d.professor,
+          rules,
         });
         return (
           d.name.toLowerCase().includes(q) ||
@@ -249,6 +250,7 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
           jumpKey={readerJumpKey}
           highlightQuery={highlightQuery}
           titleFormat={titleFormat}
+          rules={rules}
           onPageChange={onPageChange}
           onCloseMobile={onCloseDocument}
           onNotify={onNotify}
@@ -586,6 +588,7 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
                                 {formatCourseDisplayTitle(doc.name, titleFormat, {
                                   subject: doc.subject,
                                   professor: doc.professor,
+                                  rules,
                                 })}
                               </p>
                               <FileFormatBadge fileName={doc.name} format={doc.format} />
@@ -691,6 +694,9 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
                   const matchingDoc = documents.find(
                     (d) => d.relativePath === hit.docPath
                   );
+                  const displayFileName = matchingDoc?.name ?? hit.fileName;
+                  const displaySubject = matchingDoc?.subject ?? hit.subject;
+                  const displayProfessor = matchingDoc?.professor ?? hit.professor;
                   return (
                     <button
                       key={`${hit.docPath}-${hit.pageNumber}-${idx}`}
@@ -705,23 +711,24 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="flex items-center gap-1.5 min-w-0">
-                          <FileFormatIcon fileName={hit.fileName} className="w-3.5 h-3.5 shrink-0" />
+                          <FileFormatIcon fileName={displayFileName} className="w-3.5 h-3.5 shrink-0" />
                           <span className="text-xs font-semibold text-amber-300 truncate">
-                            {formatCourseDisplayTitle(hit.fileName, titleFormat, {
-                              subject: hit.subject,
-                              professor: hit.professor,
+                            {formatCourseDisplayTitle(displayFileName, titleFormat, {
+                              subject: displaySubject,
+                              professor: displayProfessor,
+                              rules,
                             })}
                           </span>
-                          <FileFormatBadge fileName={hit.fileName} />
+                          <FileFormatBadge fileName={displayFileName} />
                         </span>
                         <span className="font-mono tabular-nums text-[11px] text-slate-300 shrink-0">
-                          {hit.fileName.toLowerCase().endsWith('.pdf')
+                          {displayFileName.toLowerCase().endsWith('.pdf')
                             ? `p. ${hit.pageNumber}`
                             : `s. ${hit.pageNumber}`}
                         </span>
                       </div>
                       <div className="text-[11px] text-slate-400 truncate">
-                        {hit.subject} / {hit.professor}
+                        {displaySubject} / {displayProfessor}
                       </div>
                       <p className="text-xs text-slate-300 leading-relaxed line-clamp-2">
                         <HighlightedSnippet text={hit.snippet} query={searchQuery} />

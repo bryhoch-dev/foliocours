@@ -22,7 +22,7 @@ const LEGACY_SEED_RULE_IDS = new Set([
 ]);
 
 export const DEFAULT_TITLE_FORMAT_SETTINGS: TitleFormatSettings = {
-  inputTemplate: '{Matière} - {Prof} - {Titre}',
+  inputTemplate: '{Matière}_{Prof}_{Titre}',
   outputTemplate: '{Titre}',
   renameOnDisk: false,
   replaceUnderscoresWithSpaces: true,
@@ -163,6 +163,50 @@ function tokenizeTemplate(template: string): TemplateToken[] {
   }
 
   return tokens;
+}
+
+function templateHasBothProfAndTitle(template: string): boolean {
+  let hasProf = false;
+  let hasTitle = false;
+  for (const token of tokenizeTemplate(template)) {
+    if (token.kind === 'tag') {
+      if (token.tag === 'professor') hasProf = true;
+      if (token.tag === 'title') hasTitle = true;
+    }
+  }
+  return hasProf && hasTitle;
+}
+
+export function swapProfAndTitleInTemplate(template: string): string {
+  return template.replace(/\{([^}]+)\}/g, (fullMatch, rawTag: string) => {
+    const canonical = canonicalizeTagName(rawTag);
+    if (canonical === 'professor') return '{Titre}';
+    if (canonical === 'title') return '{Prof}';
+    return fullMatch;
+  });
+}
+
+export function swapProfAndTitleInSettings(
+  settings: TitleFormatSettings
+): TitleFormatSettings {
+  const normalized = normalizeTitleFormatSettings(settings);
+  if (templateHasBothProfAndTitle(normalized.outputTemplate)) {
+    return {
+      ...normalized,
+      outputTemplate: swapProfAndTitleInTemplate(normalized.outputTemplate),
+    };
+  }
+  if (templateHasBothProfAndTitle(normalized.inputTemplate)) {
+    return {
+      ...normalized,
+      inputTemplate: swapProfAndTitleInTemplate(normalized.inputTemplate),
+    };
+  }
+  return {
+    ...normalized,
+    inputTemplate: swapProfAndTitleInTemplate(normalized.inputTemplate),
+    outputTemplate: swapProfAndTitleInTemplate(normalized.outputTemplate),
+  };
 }
 
 /**
@@ -595,9 +639,79 @@ export function parseCourseFilename(
   };
 }
 
+const IGNORED_PREFIX_VALUES = new Set([
+  '',
+  'a organiser',
+  'non classe',
+  'general',
+  'racine',
+  'professeur non precise',
+]);
+
+function normalizePrefixCompare(value: string): string {
+  return normalizeForMatch(value.replace(/_/g, ' ')).replace(/\s+/g, ' ').trim();
+}
+
+function stripOneLeadingPrefix(
+  source: string,
+  candidates: Array<{kind: 'subject' | 'professor'; norm: string}>
+): {rest: string; matchedKind: 'subject' | 'professor'} | null {
+  const sepMatch = source.match(/^(.+?)(?:\s+[-–—:/]\s+|_+|\s*[-–—:]\s+)(.+)$/);
+  if (!sepMatch) return null;
+
+  const headNorm = normalizePrefixCompare(sepMatch[1]);
+  const rest = cleanSegment(sepMatch[2]);
+  if (!headNorm || !rest) return null;
+
+  for (const candidate of candidates) {
+    if (headNorm === candidate.norm) {
+      return {rest, matchedKind: candidate.kind};
+    }
+  }
+  return null;
+}
+
+function stripKnownSubjectAndProfessorPrefixes(
+  withoutExt: string,
+  subject?: string,
+  professor?: string
+): string {
+  const rawClean = cleanSegment(withoutExt);
+  if (!rawClean) return '';
+
+  const candidates: Array<{kind: 'subject' | 'professor'; norm: string}> = [];
+  if (subject) {
+    const normSubj = normalizePrefixCompare(subject);
+    if (!IGNORED_PREFIX_VALUES.has(normSubj)) {
+      candidates.push({kind: 'subject', norm: normSubj});
+    }
+  }
+  if (professor) {
+    const normProf = normalizePrefixCompare(professor);
+    if (!IGNORED_PREFIX_VALUES.has(normProf)) {
+      candidates.push({kind: 'professor', norm: normProf});
+    }
+  }
+  if (candidates.length === 0) return rawClean;
+
+  let current = rawClean;
+  const used = new Set<'subject' | 'professor'>();
+
+  for (let step = 0; step < 2; step++) {
+    const remainingCandidates = candidates.filter((c) => !used.has(c.kind));
+    if (remainingCandidates.length === 0) break;
+    const stripped = stripOneLeadingPrefix(current, remainingCandidates);
+    if (!stripped) break;
+    used.add(stripped.matchedKind);
+    current = stripped.rest;
+  }
+
+  return current || rawClean;
+}
+
 /**
  * Formats a course title synchronously for UI display (library list, tree, reader header)
- * using the actual file.name (never substituting parent folder professor name as document title).
+ * using the exact same parser on PC and Mobile/Cloud (never substituting parent folder name as title).
  */
 export function formatCourseDisplayTitle(
   fileName: string,
@@ -633,13 +747,19 @@ export function formatCourseDisplayTitle(
       ? overrides.professor
       : parsed.professor;
 
+  const resolvedTitle = parsed.matchedTemplate
+    ? parsed.rawTitle || cleanSegment(withoutExt)
+    : stripKnownSubjectAndProfessorPrefixes(withoutExt, subject, professor);
+
+  const detectedMeta = extractTypeAndNumber(resolvedTitle || withoutExt);
+
   return renderOutputTemplate(normalizedFormat.outputTemplate, {
     subject,
     professor,
-    rawTitle: parsed.rawTitle || cleanSegment(withoutExt),
+    rawTitle: resolvedTitle,
     originalWithoutExt: withoutExt,
-    courseType: parsed.courseType,
-    courseNumber: parsed.courseNumber,
+    courseType: parsed.courseType || detectedMeta.courseType,
+    courseNumber: parsed.courseNumber || detectedMeta.courseNumber,
     ext: detectedExt,
     replaceUnderscoresWithSpaces: normalizedFormat.replaceUnderscoresWithSpaces,
     hideExtension: normalizedFormat.hideExtension,

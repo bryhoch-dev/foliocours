@@ -780,10 +780,27 @@ export function searchCloudIndexPayload(
 
   const scoredEntries: ScoredSearchEntry[] = [];
   const docList = payload?.documents ?? [];
+  const liveByPath = new Map(fallbackDocs.map((d) => [d.relativePath, d]));
+
+  const resolveMeta = (doc: {
+    relativePath: string;
+    name: string;
+    subject: string;
+    professor: string;
+  }) => {
+    const live = liveByPath.get(doc.relativePath);
+    return {
+      relativePath: doc.relativePath,
+      name: live?.name ?? doc.name,
+      subject: live?.subject ?? doc.subject,
+      professor: live?.professor ?? doc.professor,
+    };
+  };
 
   // 1. Filename / classification matches (uses live Drive tree even if search_index.json is missing)
   const metaSource = docList.length > 0 ? docList : fallbackDocs;
-  for (const doc of metaSource) {
+  for (const rawDoc of metaSource) {
+    const doc = resolveMeta(rawDoc);
     const titleHit = evaluateTitleMatch(doc, matchers);
     if (titleHit) {
       scoredEntries.push({
@@ -804,8 +821,9 @@ export function searchCloudIndexPayload(
   }
 
   // 2. Full-text page matches inside cached search_index.json
-  for (const doc of docList) {
-    for (const page of doc.pages) {
+  for (const rawDoc of docList) {
+    const doc = resolveMeta(rawDoc);
+    for (const page of rawDoc.pages) {
       const evaluated = evaluatePageTextMatch(page.t, matchers);
       if (evaluated) {
         scoredEntries.push({
