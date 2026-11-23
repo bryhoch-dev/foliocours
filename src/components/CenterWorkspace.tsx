@@ -168,7 +168,7 @@ export const CenterWorkspace: React.FC<CenterWorkspaceProps> = ({
                   {mode === 'cloud' ? ' · Cloud Drive' : ''}
                 </p>
               </div>
-              {mode === 'local' && hasRootFolder && !needsPermissionReconnect && (
+              {mode === 'local' && (
                 <div className="flex items-center gap-1.5 flex-wrap shrink-0 justify-end">
                   <button
                     type="button"
@@ -517,11 +517,7 @@ export const CenterWorkspace: React.FC<CenterWorkspaceProps> = ({
               <button
                 type="button"
                 onClick={() => onSortClassifyFolder(true)}
-                disabled={
-                  !hasRootFolder ||
-                  needsPermissionReconnect ||
-                  isWritingImport
-                }
+                disabled={isWritingImport}
                 className="flex-1 rounded-lg bg-amber-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:opacity-45 disabled:cursor-not-allowed transition-colors cursor-pointer"
               >
                 {isWritingImport

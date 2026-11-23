@@ -14,13 +14,14 @@ import {
   getStoredDriveEmail,
   saveDriveClientId,
 } from '../services/googleDrive';
-import type {SortRule, TitleFormatSettings} from '../types/course';
+import type {AppMode, SortRule, TitleFormatSettings} from '../types/course';
 import {DEFAULT_TITLE_FORMAT_SETTINGS} from '../services/parser';
 import {CourseTitleFormatSection} from './CourseTitleFormatSection';
 import {PWAInstallButton} from './PWAInstallButton';
 
 interface SettingsAndDriveModalProps {
   isOpen: boolean;
+  mode: AppMode;
   hasRootFolder: boolean;
   rules?: SortRule[];
   titleFormat?: TitleFormatSettings;
@@ -35,6 +36,7 @@ interface SettingsAndDriveModalProps {
 
 export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
   isOpen,
+  mode,
   hasRootFolder,
   rules,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
@@ -317,15 +319,20 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
             <div className="flex flex-wrap items-center gap-2.5">
               <button
                 type="button"
-                disabled={!hasRootFolder}
                 onClick={() => {
                   onReindexAll();
                   onClose();
                 }}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700 disabled:opacity-45 cursor-pointer"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700 cursor-pointer"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
-                <span>Réindexer le dossier local</span>
+                <span>
+                  {mode === 'cloud'
+                    ? 'Actualiser l’index Cloud Drive'
+                    : hasRootFolder
+                    ? 'Réindexer le dossier local'
+                    : 'Indexer mes cours locaux'}
+                </span>
               </button>
 
               <button

@@ -302,13 +302,15 @@ export async function authenticateGoogleDrive(
     );
   }
 
-  await loadGoogleIdentityServices();
+  if (!window.google?.accounts?.oauth2) {
+    await loadGoogleIdentityServices();
+  }
 
   const knownEmail = getStoredDriveEmail();
   let tokenResult: {accessToken: string; expiresInSec: number} | null = null;
 
   // Step 2: Silent background renewal (`prompt: ''`)
-  if (!forceConsent && (knownEmail || silentOnly)) {
+  if (!forceConsent) {
     try {
       tokenResult = await requestGisToken(trimmed, {
         prompt: '',

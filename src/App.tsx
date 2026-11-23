@@ -35,7 +35,6 @@ import {
   scanOrganizePreviewItems,
   scanRootDirectory,
   sortEntireWorkspace,
-  verifyDirectoryPermission,
 } from './services/filesystem';
 import {
   loadSortRules,
@@ -401,6 +400,11 @@ export default function App() {
       setIsLoadingCloud(true);
 
       try {
+        // Start token check/renewal synchronously within click activation before any IndexedDB await
+        const tokenPromise = existingToken
+          ? Promise.resolve(existingToken)
+          : authenticateGoogleDrive(clientId, {silentOnly: silentAuto});
+
         // Hydrate cached tree and index immediately from IndexedDB while network check runs
         if (cloudDocumentsRef.current.length === 0) {
           const cachedDocs = await getCloudDocumentsCache().catch(() => []);
@@ -417,9 +421,7 @@ export default function App() {
           }
         }
 
-        let token =
-          existingToken ||
-          (await authenticateGoogleDrive(clientId, {silentOnly: silentAuto}));
+        let token = await tokenPromise;
         setIsCloudConnected(true);
 
         let libraryResult: Awaited<ReturnType<typeof fetchCloudDriveLibrary>>;
@@ -575,6 +577,37 @@ export default function App() {
     [mode, activeTab]
   );
 
+  const ensureWritableRootHandle =
+    useCallback(async (): Promise<FileSystemDirectoryHandle | null> => {
+      if (!isFsSupported) {
+        showToast(
+          "Votre navigateur ne prend pas en charge l'API File System Access. Utilisez Chrome, Edge ou Opera.",
+          'error'
+        );
+        return null;
+      }
+
+      if (!rootHandle) {
+        const picked = await window.showDirectoryPicker({mode: 'readwrite'});
+        await saveRootDirectoryHandle(picked);
+        setRootHandle(picked);
+        setRootFolderName(picked.name);
+        setNeedsPermissionReconnect(false);
+        return picked;
+      }
+
+      const currentPerm = await rootHandle.queryPermission({mode: 'readwrite'});
+      if (currentPerm !== 'granted') {
+        const requestedPerm = await rootHandle.requestPermission({mode: 'readwrite'});
+        if (requestedPerm !== 'granted') {
+          setNeedsPermissionReconnect(true);
+          return null;
+        }
+      }
+      setNeedsPermissionReconnect(false);
+      return rootHandle;
+    }, [isFsSupported, rootHandle, showToast]);
+
   const handleLinkRootFolder = async () => {
     try {
       const handle = await pickRootDirectory();
@@ -596,14 +629,20 @@ export default function App() {
   };
 
   const handleReconnectRootFolder = async () => {
-    if (!rootHandle) return;
-    const granted = await verifyDirectoryPermission(rootHandle, true);
-    if (granted) {
-      setNeedsPermissionReconnect(false);
-      await loadDirectoryAndIndex(rootHandle);
-      showToast(`Accès réactivé pour « ${rootHandle.name} ».`);
-    } else {
-      showToast('Permission refusée sur le dossier local.', 'error');
+    try {
+      const activeRoot = await ensureWritableRootHandle();
+      if (activeRoot) {
+        await loadDirectoryAndIndex(activeRoot);
+        showToast(`Accès réactivé pour « ${activeRoot.name} ».`);
+      } else {
+        showToast('Permission refusée sur le dossier local.', 'error');
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      showToast(
+        err instanceof Error ? err.message : 'Permission refusée sur le dossier local.',
+        'error'
+      );
     }
   };
 
@@ -612,19 +651,79 @@ export default function App() {
       await handleConnectOrRefreshCloud();
       return;
     }
-    if (!rootHandle || needsPermissionReconnect) return;
-    await loadDirectoryAndIndex(rootHandle);
-    showToast('Arborescence synchronisée avec le disque dur.');
+    try {
+      const activeRoot = await ensureWritableRootHandle();
+      if (!activeRoot) {
+        showToast('Permission refusée sur le dossier local.', 'error');
+        return;
+      }
+      await loadDirectoryAndIndex(activeRoot);
+      showToast('Arborescence synchronisée avec le disque dur.');
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      showToast(
+        err instanceof Error ? err.message : 'Impossible d’accéder au dossier local.',
+        'error'
+      );
+    }
+  };
+
+  const handleReindexAll = async () => {
+    if (mode === 'cloud') {
+      await handleConnectOrRefreshCloud();
+      return;
+    }
+    try {
+      const activeRoot = await ensureWritableRootHandle();
+      if (!activeRoot) {
+        showToast('Permission refusée sur le dossier local.', 'error');
+        return;
+      }
+      await loadDirectoryAndIndex(activeRoot, true);
+      showToast('Réindexation complète lancée en arrière-plan.');
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      showToast(
+        err instanceof Error ? err.message : 'Impossible d’indexer le dossier local.',
+        'error'
+      );
+    }
   };
 
   const handleOpenDocument = useCallback(
-    (doc: CourseDocument, page = 1, query = '') => {
+    async (doc: CourseDocument, page = 1, query = '') => {
+      if (doc.source !== 'cloud') {
+        try {
+          const activeRoot = await ensureWritableRootHandle();
+          if (!activeRoot) {
+            showToast('Permission requise pour ouvrir ce fichier local.', 'error');
+            return;
+          }
+          if (doc.handle) {
+            const filePerm = await doc.handle.queryPermission({mode: 'read'});
+            if (filePerm !== 'granted') {
+              const reqPerm = await doc.handle.requestPermission({mode: 'read'});
+              if (reqPerm !== 'granted') {
+                showToast('Permission refusée sur ce fichier local.', 'error');
+                return;
+              }
+            }
+          }
+        } catch (err) {
+          if (err instanceof DOMException && err.name === 'AbortError') return;
+          showToast(
+            err instanceof Error ? err.message : 'Impossible d’accéder au fichier local.',
+            'error'
+          );
+          return;
+        }
+      }
       setActiveDoc(doc);
       setReaderPage(page);
       setHighlightQuery(query);
       setReaderJumpKey((k) => k + 1);
     },
-    []
+    [ensureWritableRootHandle, showToast]
   );
 
   const handleCloseDocument = useCallback(() => {
@@ -633,9 +732,21 @@ export default function App() {
   }, []);
 
   const handleRefreshClassifyQueue = async () => {
-    if (!rootHandle || needsPermissionReconnect) return;
-    await refreshClassifyQueue(rootHandle, titleFormat, rules);
-    showToast(`Dossier « ${CLASSIFY_FOLDER_NAME} » rescanné.`);
+    try {
+      const activeRoot = await ensureWritableRootHandle();
+      if (!activeRoot) {
+        showToast('Permission refusée sur le dossier local.', 'error');
+        return;
+      }
+      await refreshClassifyQueue(activeRoot, titleFormat, rules);
+      showToast(`Dossier « ${CLASSIFY_FOLDER_NAME} » rescanné.`);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      showToast(
+        err instanceof Error ? err.message : 'Impossible d’accéder au dossier local.',
+        'error'
+      );
+    }
   };
 
   const handleUpdateQueueItem = (
@@ -648,13 +759,24 @@ export default function App() {
   };
 
   const handleSortWorkspace = async (useEditedQueue = false) => {
-    if (!rootHandle || needsPermissionReconnect) {
-      showToast('Veuillez lier votre dossier local avant de trier les fichiers.', 'error');
+    if (mode === 'cloud') {
+      await handleConnectOrRefreshCloud();
       return;
     }
 
-    const granted = await verifyDirectoryPermission(rootHandle, true);
-    if (!granted) {
+    let activeRoot: FileSystemDirectoryHandle | null = null;
+    try {
+      activeRoot = await ensureWritableRootHandle();
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      showToast(
+        err instanceof Error ? err.message : 'Impossible d’accéder au dossier local.',
+        'error'
+      );
+      return;
+    }
+
+    if (!activeRoot) {
       showToast('Permission d’écriture requise sur le dossier local.', 'error');
       return;
     }
@@ -678,12 +800,12 @@ export default function App() {
       }
 
       const result = await sortEntireWorkspace(
-        rootHandle,
+        activeRoot,
         (name, mime) => parseCourseFilename(name, titleFormat, mime, rules),
         overridesMap
       );
 
-      await loadDirectoryAndIndex(rootHandle);
+      await loadDirectoryAndIndex(activeRoot);
 
       const {
         movedCount,
@@ -752,13 +874,14 @@ export default function App() {
     target: RenameFolderTarget,
     newName: string
   ) => {
-    if (!rootHandle || needsPermissionReconnect) {
-      throw new Error('Veuillez lier votre dossier local avant de renommer.');
+    const activeRoot = await ensureWritableRootHandle();
+    if (!activeRoot) {
+      throw new Error('Permission d’écriture requise sur le dossier local.');
     }
 
     setIsRenamingFolder(true);
     try {
-      const renameRes = await renameWorkspaceDirectory(rootHandle, {
+      const renameRes = await renameWorkspaceDirectory(activeRoot, {
         kind: target.kind,
         subjectName: target.subjectName,
         professorName: target.professorName,
@@ -828,7 +951,7 @@ export default function App() {
         }
       }
 
-      await loadDirectoryAndIndex(rootHandle, false, syncRes.rules, titleFormat);
+      await loadDirectoryAndIndex(activeRoot, false, syncRes.rules, titleFormat);
 
       const ruleMsg =
         syncRes.action === 'updated'
@@ -1091,7 +1214,24 @@ export default function App() {
           onSearchQueryChange={setSearchQuery}
           onWholeWordOnlyChange={setSearchWholeWordOnly}
           onOpenRules={() => setIsRulesModalOpen(true)}
-          onOpenFlattenModal={() => setIsFlattenModalOpen(true)}
+          onOpenFlattenModal={async () => {
+            try {
+              const activeRoot = await ensureWritableRootHandle();
+              if (!activeRoot) {
+                showToast('Permission requise sur le dossier local.', 'error');
+                return;
+              }
+              setIsFlattenModalOpen(true);
+            } catch (err) {
+              if (err instanceof DOMException && err.name === 'AbortError') return;
+              showToast(
+                err instanceof Error
+                  ? err.message
+                  : 'Impossible d’accéder au dossier local.',
+                'error'
+              );
+            }
+          }}
         />
 
         <PdfReaderPanel
@@ -1180,18 +1320,14 @@ export default function App() {
 
       <SettingsAndDriveModal
         isOpen={isSettingsModalOpen}
+        mode={mode}
         hasRootFolder={!!rootHandle && !needsPermissionReconnect}
         rules={rules}
         titleFormat={titleFormat}
         sampleFilename={sampleFilename}
         onChangeTitleFormat={handleSaveTitleFormat}
         onClose={() => setIsSettingsModalOpen(false)}
-        onReindexAll={() => {
-          if (rootHandle && !needsPermissionReconnect) {
-            void loadDirectoryAndIndex(rootHandle, true);
-            showToast('Réindexation complète lancée en arrière-plan.');
-          }
-        }}
+        onReindexAll={() => void handleReindexAll()}
         onClearIndex={async () => {
           await clearSearchIndex();
           setLocalDocuments((prev) =>
