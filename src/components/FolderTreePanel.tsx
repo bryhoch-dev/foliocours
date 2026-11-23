@@ -6,6 +6,7 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  Loader2,
   Pencil,
   RefreshCw,
 } from 'lucide-react';
@@ -136,14 +137,16 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
   };
 
   const isSourceReady =
-    mode === 'cloud' ? isCloudConnected : !!rootFolderName && !needsPermissionReconnect;
+    mode === 'cloud'
+      ? isCloudConnected || tree.length > 0
+      : !!rootFolderName && !needsPermissionReconnect;
 
   return (
     <aside className="w-64 xl:w-72 shrink-0 border-r border-slate-800/90 bg-[#0F172A] flex flex-col min-h-0">
       {/* Source connection block */}
       <div className="p-3.5 border-b border-slate-800/80 space-y-2.5">
         {mode === 'cloud' ? (
-          !isCloudConnected ? (
+          !isCloudConnected && tree.length === 0 ? (
             <div className="space-y-2">
               <p className="text-xs text-slate-400 leading-relaxed">
                 Consultez l’arborescence <span className="font-mono text-slate-200">Sauvegarde_Cours</span> sur Google Drive sans stockage local.
@@ -178,15 +181,24 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
                     Sauvegarde_Cours
                   </span>
                 </button>
-                <button
-                  type="button"
-                  onClick={onRefreshTree}
-                  disabled={isLoadingCloud}
-                  title="Actualiser depuis Google Drive"
-                  className="rounded-md p-1.5 text-slate-400 hover:bg-slate-800 hover:text-slate-100 transition-colors cursor-pointer shrink-0"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isLoadingCloud ? 'animate-spin' : ''}`} />
-                </button>
+                <div className="flex items-center gap-1 shrink-0">
+                  {isLoadingCloud && (
+                    <Loader2
+                      className="w-3.5 h-3.5 animate-spin text-amber-400 shrink-0"
+                      aria-label="Synchronisation Google Drive en cours"
+                    />
+                  )}
+                  <button
+                    type="button"
+                    onClick={onRefreshTree}
+                    disabled={isLoadingCloud}
+                    title="Actualiser depuis Google Drive"
+                    aria-label="Actualiser depuis Google Drive"
+                    className="rounded-md p-1.5 text-slate-400 hover:bg-slate-800 hover:text-slate-100 disabled:opacity-50 transition-colors cursor-pointer shrink-0"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isLoadingCloud ? 'animate-spin' : ''}`} />
+                  </button>
+                </div>
               </div>
               <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono tabular-nums">
                 <span>{tree.length} matières</span>

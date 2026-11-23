@@ -1,6 +1,7 @@
 import type {
   CloudSearchIndexDocument,
   CloudSearchIndexPayload,
+  CourseDocument,
   SearchResult,
   StoredDocumentMeta,
   StoredPageText,
@@ -15,6 +16,7 @@ const STORE_PAGES = 'pages';
 const STORE_CLOUD_FILES = 'cloud_files';
 
 const CLOUD_INDEX_KEY = 'cloud_search_index';
+const CLOUD_LIBRARY_KEY = 'cloud_library_tree';
 
 export interface CachedCloudFile {
   driveFileId: string;
@@ -117,6 +119,28 @@ export async function clearCloudSearchIndex(): Promise<void> {
   });
 }
 
+export async function saveCloudDocumentsCache(docs: CourseDocument[]): Promise<void> {
+  const db = await openDatabase();
+  const serializable = docs.map(({handle: _handle, ...rest}) => rest);
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_HANDLES, 'readwrite');
+    tx.objectStore(STORE_HANDLES).put(serializable, CLOUD_LIBRARY_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function getCloudDocumentsCache(): Promise<CourseDocument[]> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_HANDLES, 'readonly');
+    const req = tx.objectStore(STORE_HANDLES).get(CLOUD_LIBRARY_KEY);
+    req.onsuccess = () =>
+      resolve(Array.isArray(req.result) ? (req.result as CourseDocument[]) : []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
 export async function getCachedCloudFile(
   driveFileId: string
 ): Promise<CachedCloudFile | null> {
@@ -180,6 +204,7 @@ export async function clearAllOfflineCloudCache(): Promise<void> {
     const tx = db.transaction([STORE_CLOUD_FILES, STORE_HANDLES], 'readwrite');
     tx.objectStore(STORE_CLOUD_FILES).clear();
     tx.objectStore(STORE_HANDLES).delete(CLOUD_INDEX_KEY);
+    tx.objectStore(STORE_HANDLES).delete(CLOUD_LIBRARY_KEY);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });

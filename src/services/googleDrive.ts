@@ -279,8 +279,15 @@ function requestGisToken(
  */
 export async function authenticateGoogleDrive(
   clientId: string,
-  forceConsent = false
+  optionsOrForceConsent: boolean | {forceConsent?: boolean; silentOnly?: boolean} = false
 ): Promise<string> {
+  const forceConsent =
+    typeof optionsOrForceConsent === 'boolean'
+      ? optionsOrForceConsent
+      : !!optionsOrForceConsent.forceConsent;
+  const silentOnly =
+    typeof optionsOrForceConsent === 'object' && !!optionsOrForceConsent.silentOnly;
+
   if (!forceConsent) {
     const validToken = getMemoryAccessToken();
     if (validToken) {
@@ -300,21 +307,25 @@ export async function authenticateGoogleDrive(
   const knownEmail = getStoredDriveEmail();
   let tokenResult: {accessToken: string; expiresInSec: number} | null = null;
 
-  // Step 2: Silent background renewal when we already know the user's email
-  if (!forceConsent && knownEmail) {
+  // Step 2: Silent background renewal (`prompt: ''`)
+  if (!forceConsent && (knownEmail || silentOnly)) {
     try {
       tokenResult = await requestGisToken(trimmed, {
         prompt: '',
-        hint: knownEmail,
+        ...(knownEmail ? {hint: knownEmail} : {}),
         timeoutMs: 8000,
       });
     } catch {
-      // Silent renewal failed -> fall through to interactive popup
+      // Silent renewal failed
       tokenResult = null;
     }
   }
 
-  // Step 3: Interactive popup fallback
+  if (!tokenResult && silentOnly) {
+    throw new Error('Renouvellement silencieux Google Drive requis.');
+  }
+
+  // Step 3: Interactive popup fallback (only for explicit user action)
   if (!tokenResult) {
     tokenResult = await requestGisToken(trimmed, {
       prompt: forceConsent ? 'consent' : knownEmail ? 'select_account' : 'consent',

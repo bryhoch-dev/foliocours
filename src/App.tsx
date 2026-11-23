@@ -14,9 +14,11 @@ import type {
 import {
   clearSearchIndex,
   getAllIndexedDocuments,
+  getCloudDocumentsCache,
   getCloudSearchIndex,
   getRootDirectoryHandle,
   pruneMissingDocuments,
+  saveCloudDocumentsCache,
   saveCloudSearchIndex,
   saveRootDirectoryHandle,
   searchCloudIndexPayload,
@@ -53,6 +55,7 @@ import {
   fetchDriveFileModifiedTime,
   getMemoryAccessToken,
   getSavedDriveClientId,
+  getStoredDriveEmail,
   type DriveMirrorAnalysisResult,
   type DriveMirrorProgress,
 } from './services/googleDrive';
@@ -77,6 +80,26 @@ function detectInitialMode(): AppMode {
   return 'local';
 }
 
+function areCloudDocumentListsEqual(a: CourseDocument[], b: CourseDocument[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const left = a[i];
+    const right = b[i];
+    if (
+      left.relativePath !== right.relativePath ||
+      left.driveFileId !== right.driveFileId ||
+      left.driveParentFolderId !== right.driveParentFolderId ||
+      left.driveModifiedTime !== right.driveModifiedTime ||
+      left.size !== right.size ||
+      left.lastModified !== right.lastModified ||
+      left.pageCount !== right.pageCount
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export default function App() {
   const isFsSupported = useMemo(() => isFileSystemAccessSupported(), []);
   const [mode, setMode] = useState<AppMode>(detectInitialMode);
@@ -93,6 +116,12 @@ export default function App() {
   const [hasBackupFolder, setHasBackupFolder] = useState(true);
   const [cloudDocuments, setCloudDocuments] = useState<CourseDocument[]>([]);
   const [cloudIndex, setCloudIndex] = useState<CloudSearchIndexPayload | null>(null);
+  const cloudDocumentsRef = useRef<CourseDocument[]>(cloudDocuments);
+  cloudDocumentsRef.current = cloudDocuments;
+  const cloudIndexRef = useRef<CloudSearchIndexPayload | null>(cloudIndex);
+  cloudIndexRef.current = cloudIndex;
+  const isCloudRefreshingRef = useRef(false);
+  const lastAutoCloudRefreshAtRef = useRef(0);
 
   // Navigation & Selection State
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('library');
@@ -244,97 +273,29 @@ export default function App() {
     [refreshClassifyQueue, titleFormat, rules, runIndexing]
   );
 
-  // Restore saved local directory handle & cached cloud search index on startup
+  // Restore saved local directory handle & cached cloud tree/index on startup
   useEffect(() => {
     let mounted = true;
     (async () => {
-      let cachedIndexRef: CloudSearchIndexPayload | null = null;
       try {
-        const cachedCloudIdx = await getCloudSearchIndex();
+        const [cachedCloudIdx, cachedCloudDocs] = await Promise.all([
+          getCloudSearchIndex().catch(() => null),
+          getCloudDocumentsCache().catch(() => [] as CourseDocument[]),
+        ]);
         if (mounted && cachedCloudIdx) {
-          cachedIndexRef = cachedCloudIdx;
+          cloudIndexRef.current = cachedCloudIdx;
           setCloudIndex(cachedCloudIdx);
         }
+        if (mounted && cachedCloudDocs.length > 0) {
+          cloudDocumentsRef.current = cachedCloudDocs;
+          setCloudDocuments(cachedCloudDocs);
+        }
       } catch {
-        // ignore
+        // ignore IndexedDB cache restore error
       }
 
-      // Restore valid Google Drive session silently on startup without ever opening a popup
-      const restoredToken = getMemoryAccessToken();
-      if (restoredToken && mounted) {
+      if (getMemoryAccessToken() && mounted) {
         setIsCloudConnected(true);
-        if (detectInitialMode() === 'cloud') {
-          void fetchCloudDriveLibrary(restoredToken)
-            .then(
-              async ({
-                hasBackupFolder: folderExists,
-                documents: remoteDocs,
-                searchIndexFileId,
-                searchIndexModifiedTime,
-              }) => {
-                if (!mounted) return;
-                setHasBackupFolder(folderExists);
-                let idx = cachedIndexRef;
-                if (searchIndexFileId) {
-                  try {
-                    const remoteModifiedTime =
-                      (await fetchDriveFileModifiedTime(
-                        restoredToken,
-                        searchIndexFileId
-                      )) ?? searchIndexModifiedTime;
-                    const cachedTs = idx?.driveModifiedTime
-                      ? Date.parse(idx.driveModifiedTime)
-                      : 0;
-                    const remoteTs = remoteModifiedTime
-                      ? Date.parse(remoteModifiedTime)
-                      : 0;
-                    const needsDownload =
-                      !idx ||
-                      !idx.driveModifiedTime ||
-                      (remoteTs > 0 && remoteTs > cachedTs) ||
-                      (!!remoteModifiedTime &&
-                        remoteModifiedTime !== idx.driveModifiedTime);
-
-                    if (needsDownload) {
-                      const downloaded = await downloadCloudSearchIndex(
-                        restoredToken,
-                        searchIndexFileId
-                      );
-                      idx = {
-                        ...downloaded,
-                        driveFileId: searchIndexFileId,
-                        driveModifiedTime: remoteModifiedTime ?? undefined,
-                      };
-                      await saveCloudSearchIndex(idx);
-                      if (mounted) setCloudIndex(idx);
-                    }
-                  } catch {
-                    // keep cached index if offline or metadata unchanged
-                  }
-                }
-                const pageCountMap = new Map<string, number>();
-                if (idx) {
-                  for (const d of idx.documents) {
-                    pageCountMap.set(d.relativePath, d.pageCount);
-                  }
-                }
-                if (mounted) {
-                  setCloudDocuments(
-                    remoteDocs.map((doc) => ({
-                      ...doc,
-                      pageCount: pageCountMap.get(doc.relativePath) ?? doc.pageCount,
-                    }))
-                  );
-                }
-              }
-            )
-            .catch(() => {
-              // Silent startup restore failure must never pop up OAuth
-              if (mounted && !getMemoryAccessToken()) {
-                setIsCloudConnected(false);
-              }
-            });
-        }
       }
 
       if (!isFsSupported) return;
@@ -406,123 +367,194 @@ export default function App() {
     };
   }, [activeTab, searchQuery, mode, cloudIndex, cloudDocuments]);
 
-  const handleConnectOrRefreshCloud = useCallback(async () => {
-    const existingToken = getMemoryAccessToken();
-    const clientId = getSavedDriveClientId();
+  const handleConnectOrRefreshCloud = useCallback(
+    async (options?: {silentAuto?: boolean}) => {
+      const silentAuto = !!options?.silentAuto;
+      if (isCloudRefreshingRef.current) return;
 
-    if (!existingToken && !clientId.trim()) {
-      showToast(
-        'Configurez d’abord votre Client ID Google Cloud dans les paramètres.',
-        'error'
-      );
-      if (window.innerWidth >= 768) {
-        setIsSettingsModalOpen(true);
-      }
-      return;
-    }
+      const existingToken = getMemoryAccessToken();
+      const clientId = getSavedDriveClientId();
 
-    setIsLoadingCloud(true);
-    try {
-      let token = existingToken || (await authenticateGoogleDrive(clientId));
-      setIsCloudConnected(true);
-
-      let libraryResult: Awaited<ReturnType<typeof fetchCloudDriveLibrary>>;
-      try {
-        libraryResult = await fetchCloudDriveLibrary(token);
-      } catch (libErr) {
-        if (
-          !getMemoryAccessToken() &&
-          libErr instanceof Error &&
-          libErr.message.includes('Session Google expirée')
-        ) {
-          token = await authenticateGoogleDrive(clientId);
-          libraryResult = await fetchCloudDriveLibrary(token);
-        } else {
-          throw libErr;
-        }
-      }
-
-      const {
-        hasBackupFolder: folderExists,
-        documents: remoteDocs,
-        searchIndexFileId,
-        searchIndexModifiedTime,
-      } = libraryResult;
-      setHasBackupFolder(folderExists);
-
-      let latestIndex = cloudIndex;
-      let indexDownloadedFresh = false;
-      if (searchIndexFileId) {
-        try {
-          const remoteModifiedTime =
-            (await fetchDriveFileModifiedTime(token, searchIndexFileId)) ??
-            searchIndexModifiedTime;
-          const cachedTs = latestIndex?.driveModifiedTime
-            ? Date.parse(latestIndex.driveModifiedTime)
-            : 0;
-          const remoteTs = remoteModifiedTime ? Date.parse(remoteModifiedTime) : 0;
-          const needsDownload =
-            !latestIndex ||
-            !latestIndex.driveModifiedTime ||
-            (remoteTs > 0 && remoteTs > cachedTs) ||
-            (!!remoteModifiedTime &&
-              remoteModifiedTime !== latestIndex.driveModifiedTime);
-
-          if (needsDownload) {
-            const downloaded = await downloadCloudSearchIndex(token, searchIndexFileId);
-            latestIndex = {
-              ...downloaded,
-              driveFileId: searchIndexFileId,
-              driveModifiedTime: remoteModifiedTime ?? undefined,
-            };
-            await saveCloudSearchIndex(latestIndex);
-            setCloudIndex(latestIndex);
-            indexDownloadedFresh = true;
+      if (!existingToken && !clientId.trim()) {
+        if (!silentAuto) {
+          showToast(
+            'Configurez d’abord votre Client ID Google Cloud dans les paramètres.',
+            'error'
+          );
+          if (window.innerWidth >= 768) {
+            setIsSettingsModalOpen(true);
           }
-        } catch (idxErr) {
-          console.warn('Impossible de charger search_index.json:', idxErr);
         }
+        return;
       }
 
-      // Enrich page counts from search_index.json without downloading PDFs
-      const pageCountMap = new Map<string, number>();
-      if (latestIndex) {
-        for (const d of latestIndex.documents) {
-          pageCountMap.set(d.relativePath, d.pageCount);
-        }
+      if (!silentAuto) {
+        lastAutoCloudRefreshAtRef.current = Date.now();
       }
 
-      const enriched = remoteDocs.map((doc) => ({
-        ...doc,
-        pageCount: pageCountMap.get(doc.relativePath) ?? doc.pageCount,
-      }));
-      setCloudDocuments(enriched);
+      isCloudRefreshingRef.current = true;
+      setIsLoadingCloud(true);
 
-      if (!folderExists) {
-        showToast('Dossier « Sauvegarde_Cours » introuvable sur votre Drive.', 'error');
-      } else {
-        showToast(
-          `${enriched.length} cours chargés depuis Google Drive${
-            latestIndex
-              ? indexDownloadedFresh
-                ? ' (index téléchargé)'
-                : ' (index en cache déjà à jour)'
-              : ''
-          }.`
+      try {
+        // Hydrate cached tree and index immediately from IndexedDB while network check runs
+        if (cloudDocumentsRef.current.length === 0) {
+          const cachedDocs = await getCloudDocumentsCache().catch(() => []);
+          if (cachedDocs.length > 0 && cloudDocumentsRef.current.length === 0) {
+            cloudDocumentsRef.current = cachedDocs;
+            setCloudDocuments(cachedDocs);
+          }
+        }
+        if (!cloudIndexRef.current) {
+          const cachedIdx = await getCloudSearchIndex().catch(() => null);
+          if (cachedIdx && !cloudIndexRef.current) {
+            cloudIndexRef.current = cachedIdx;
+            setCloudIndex(cachedIdx);
+          }
+        }
+
+        let token =
+          existingToken ||
+          (await authenticateGoogleDrive(clientId, {silentOnly: silentAuto}));
+        setIsCloudConnected(true);
+
+        let libraryResult: Awaited<ReturnType<typeof fetchCloudDriveLibrary>>;
+        try {
+          libraryResult = await fetchCloudDriveLibrary(token);
+        } catch (libErr) {
+          if (
+            !getMemoryAccessToken() &&
+            libErr instanceof Error &&
+            libErr.message.includes('Session Google expirée')
+          ) {
+            token = await authenticateGoogleDrive(clientId, {silentOnly: silentAuto});
+            libraryResult = await fetchCloudDriveLibrary(token);
+          } else {
+            throw libErr;
+          }
+        }
+
+        const {
+          hasBackupFolder: folderExists,
+          documents: remoteDocs,
+          searchIndexFileId,
+          searchIndexModifiedTime,
+        } = libraryResult;
+        setHasBackupFolder(folderExists);
+
+        let latestIndex = cloudIndexRef.current;
+        let indexDownloadedFresh = false;
+        if (searchIndexFileId) {
+          try {
+            const remoteModifiedTime =
+              (await fetchDriveFileModifiedTime(token, searchIndexFileId)) ??
+              searchIndexModifiedTime;
+            const cachedTs = latestIndex?.driveModifiedTime
+              ? Date.parse(latestIndex.driveModifiedTime)
+              : 0;
+            const remoteTs = remoteModifiedTime ? Date.parse(remoteModifiedTime) : 0;
+            const needsDownload =
+              !latestIndex ||
+              !latestIndex.driveModifiedTime ||
+              (remoteTs > 0 && remoteTs > cachedTs) ||
+              (!!remoteModifiedTime &&
+                remoteModifiedTime !== latestIndex.driveModifiedTime);
+
+            if (needsDownload) {
+              const downloaded = await downloadCloudSearchIndex(
+                token,
+                searchIndexFileId
+              );
+              latestIndex = {
+                ...downloaded,
+                driveFileId: searchIndexFileId,
+                driveModifiedTime: remoteModifiedTime ?? undefined,
+              };
+              await saveCloudSearchIndex(latestIndex);
+              cloudIndexRef.current = latestIndex;
+              setCloudIndex(latestIndex);
+              indexDownloadedFresh = true;
+            }
+          } catch (idxErr) {
+            console.warn('Impossible de charger search_index.json:', idxErr);
+          }
+        }
+
+        // Enrich page counts from search_index.json without downloading PDFs
+        const pageCountMap = new Map<string, number>();
+        if (latestIndex) {
+          for (const d of latestIndex.documents) {
+            pageCountMap.set(d.relativePath, d.pageCount);
+          }
+        }
+
+        const enriched = remoteDocs.map((doc) => ({
+          ...doc,
+          pageCount: pageCountMap.get(doc.relativePath) ?? doc.pageCount,
+        }));
+
+        const docsChanged = !areCloudDocumentListsEqual(
+          cloudDocumentsRef.current,
+          enriched
         );
+        if (docsChanged) {
+          cloudDocumentsRef.current = enriched;
+          setCloudDocuments(enriched);
+          await saveCloudDocumentsCache(enriched).catch(() => {});
+        }
+
+        if (!folderExists) {
+          if (!silentAuto) {
+            showToast(
+              'Dossier « Sauvegarde_Cours » introuvable sur votre Drive.',
+              'error'
+            );
+          }
+        } else if (!silentAuto) {
+          showToast(
+            `${enriched.length} cours chargés depuis Google Drive${
+              latestIndex
+                ? indexDownloadedFresh
+                  ? ' (index téléchargé)'
+                  : ' (index en cache déjà à jour)'
+                : ''
+            }.`
+          );
+        } else if (docsChanged || indexDownloadedFresh) {
+          showToast(`Cloud Drive mis à jour (${enriched.length} cours).`);
+        }
+      } catch (err) {
+        if (!getMemoryAccessToken()) {
+          setIsCloudConnected(false);
+        }
+        if (!silentAuto) {
+          showToast(
+            err instanceof Error ? err.message : 'Erreur de connexion Google Drive.',
+            'error'
+          );
+        }
+      } finally {
+        isCloudRefreshingRef.current = false;
+        setIsLoadingCloud(false);
       }
-    } catch (err) {
-      if (!getMemoryAccessToken()) {
-        setIsCloudConnected(false);
-      }
-      showToast(
-        err instanceof Error ? err.message : 'Erreur de connexion Google Drive.',
-        'error'
-      );
-    } finally {
-      setIsLoadingCloud(false);
-    }
-  }, [cloudIndex, showToast]);
+    },
+    [showToast]
+  );
+
+  // Automatic refresh when switching to the « Cloud Drive » tab (20s cooldown + isRefreshing lock)
+  useEffect(() => {
+    if (mode !== 'cloud') return;
+    if (isCloudRefreshingRef.current) return;
+
+    const now = Date.now();
+    if (now - lastAutoCloudRefreshAtRef.current < 20_000) return;
+
+    const clientId = getSavedDriveClientId().trim();
+    if (!clientId) return;
+    if (!getMemoryAccessToken() && !getStoredDriveEmail()) return;
+
+    lastAutoCloudRefreshAtRef.current = now;
+    void handleConnectOrRefreshCloud({silentAuto: true});
+  }, [mode, handleConnectOrRefreshCloud]);
 
   const handleChangeMode = useCallback(
     (nextMode: AppMode) => {
@@ -534,13 +566,8 @@ export default function App() {
       if (nextMode === 'cloud' && activeTab === 'import') {
         setActiveTab('library');
       }
-      if (nextMode === 'cloud' && cloudDocuments.length === 0) {
-        if (getMemoryAccessToken() || getSavedDriveClientId().trim()) {
-          void handleConnectOrRefreshCloud();
-        }
-      }
     },
-    [mode, activeTab, cloudDocuments.length, handleConnectOrRefreshCloud]
+    [mode, activeTab]
   );
 
   const handleLinkRootFolder = async () => {

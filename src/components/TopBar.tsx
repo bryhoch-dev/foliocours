@@ -1,5 +1,5 @@
 import React from 'react';
-import {Cloud, CloudUpload, HardDrive, RefreshCw, Search} from 'lucide-react';
+import {Cloud, CloudUpload, HardDrive, Loader2, RefreshCw, Search} from 'lucide-react';
 import type {AppMode, WorkspaceTab} from '../types/course';
 import {PWAInstallButton} from './PWAInstallButton';
 
@@ -84,6 +84,12 @@ export const TopBar: React.FC<TopBarProps> = ({
           >
             <Cloud className="w-3.5 h-3.5 shrink-0" />
             <span>Cloud Drive</span>
+            {isLoadingCloud && (
+              <Loader2
+                className="w-3 h-3 animate-spin text-amber-400 shrink-0"
+                aria-label="Synchronisation Drive en cours"
+              />
+            )}
           </button>
         </div>
       </div>

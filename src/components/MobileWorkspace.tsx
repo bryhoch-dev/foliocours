@@ -8,6 +8,7 @@ import {
   Folder,
   FolderPlus,
   HardDrive,
+  Loader2,
   RefreshCw,
   Search,
   Trash2,
@@ -248,7 +249,9 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
   }
 
   const isSourceReady =
-    mode === 'cloud' ? isCloudConnected : hasRootFolder && !needsPermissionReconnect;
+    mode === 'cloud'
+      ? isCloudConnected || documents.length > 0
+      : hasRootFolder && !needsPermissionReconnect;
 
   const canGoBackInCourses =
     mobileTab === 'courses' && (selectedProfessor !== null || selectedSubject !== null);
@@ -305,30 +308,47 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
           </h1>
         </div>
 
-        {/* Manual Mode Switcher on Mobile Header */}
-        <div
-          role="group"
-          aria-label="Basculer PC ou Cloud"
-          className="inline-flex items-center rounded-lg border border-slate-800 bg-[#0B1120] p-0.5 shrink-0"
-        >
-          <button
-            type="button"
-            onClick={() => onChangeMode('local')}
-            className={`px-2 py-1 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
-              mode === 'local' ? 'bg-slate-800 text-amber-300' : 'text-slate-400'
-            }`}
+        {/* Manual Mode Switcher + Cloud Refresh on Mobile Header */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {mode === 'cloud' && (
+            <button
+              type="button"
+              onClick={onRefreshCloud}
+              disabled={isLoadingCloud}
+              aria-label="Actualiser Google Drive"
+              title="Actualiser Google Drive"
+              className="p-1.5 rounded-lg border border-slate-800 bg-[#0B1120] text-slate-300 active:bg-slate-800 disabled:opacity-50 cursor-pointer shrink-0"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isLoadingCloud ? 'animate-spin text-amber-400' : ''}`} />
+            </button>
+          )}
+          <div
+            role="group"
+            aria-label="Basculer PC ou Cloud"
+            className="inline-flex items-center rounded-lg border border-slate-800 bg-[#0B1120] p-0.5 shrink-0"
           >
-            PC
-          </button>
-          <button
-            type="button"
-            onClick={() => onChangeMode('cloud')}
-            className={`px-2 py-1 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
-              mode === 'cloud' ? 'bg-slate-800 text-amber-300' : 'text-slate-400'
-            }`}
-          >
-            Cloud
-          </button>
+            <button
+              type="button"
+              onClick={() => onChangeMode('local')}
+              className={`px-2 py-1 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                mode === 'local' ? 'bg-slate-800 text-amber-300' : 'text-slate-400'
+              }`}
+            >
+              PC
+            </button>
+            <button
+              type="button"
+              onClick={() => onChangeMode('cloud')}
+              className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors cursor-pointer ${
+                mode === 'cloud' ? 'bg-slate-800 text-amber-300' : 'text-slate-400'
+              }`}
+            >
+              <span>Cloud</span>
+              {isLoadingCloud && (
+                <Loader2 className="w-2.5 h-2.5 animate-spin text-amber-400 shrink-0" />
+              )}
+            </button>
+          </div>
         </div>
       </header>
 
