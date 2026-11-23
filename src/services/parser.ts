@@ -25,9 +25,32 @@ export const DEFAULT_TITLE_FORMAT_SETTINGS: TitleFormatSettings = {
   inputTemplate: '{Matière} - {Prof} - {Titre}',
   outputTemplate: '{Titre}',
   renameOnDisk: false,
+  replaceUnderscoresWithSpaces: true,
+  hideExtension: true,
 };
 
 export const DEFAULT_SORT_RULES: SortRule[] = [];
+
+export function normalizeTitleFormatSettings(
+  raw?: Partial<TitleFormatSettings> | null
+): TitleFormatSettings {
+  if (!raw || typeof raw !== 'object') {
+    return {...DEFAULT_TITLE_FORMAT_SETTINGS};
+  }
+  return {
+    inputTemplate:
+      typeof raw.inputTemplate === 'string' && raw.inputTemplate.trim()
+        ? raw.inputTemplate
+        : DEFAULT_TITLE_FORMAT_SETTINGS.inputTemplate,
+    outputTemplate:
+      typeof raw.outputTemplate === 'string' && raw.outputTemplate.trim()
+        ? raw.outputTemplate
+        : DEFAULT_TITLE_FORMAT_SETTINGS.outputTemplate,
+    renameOnDisk: Boolean(raw.renameOnDisk),
+    replaceUnderscoresWithSpaces: raw.replaceUnderscoresWithSpaces !== false,
+    hideExtension: raw.hideExtension !== false,
+  };
+}
 
 export function loadSortRules(): SortRule[] {
   try {
@@ -59,27 +82,20 @@ export function loadTitleFormatSettings(): TitleFormatSettings {
         TITLE_FORMAT_STORAGE_KEY,
         JSON.stringify(DEFAULT_TITLE_FORMAT_SETTINGS)
       );
-      return DEFAULT_TITLE_FORMAT_SETTINGS;
+      return {...DEFAULT_TITLE_FORMAT_SETTINGS};
     }
     const parsed = JSON.parse(raw) as Partial<TitleFormatSettings>;
-    return {
-      inputTemplate:
-        typeof parsed.inputTemplate === 'string' && parsed.inputTemplate.trim()
-          ? parsed.inputTemplate
-          : DEFAULT_TITLE_FORMAT_SETTINGS.inputTemplate,
-      outputTemplate:
-        typeof parsed.outputTemplate === 'string' && parsed.outputTemplate.trim()
-          ? parsed.outputTemplate
-          : DEFAULT_TITLE_FORMAT_SETTINGS.outputTemplate,
-      renameOnDisk: Boolean(parsed.renameOnDisk),
-    };
+    return normalizeTitleFormatSettings(parsed);
   } catch {
-    return DEFAULT_TITLE_FORMAT_SETTINGS;
+    return {...DEFAULT_TITLE_FORMAT_SETTINGS};
   }
 }
 
 export function saveTitleFormatSettings(settings: TitleFormatSettings): void {
-  localStorage.setItem(TITLE_FORMAT_STORAGE_KEY, JSON.stringify(settings));
+  localStorage.setItem(
+    TITLE_FORMAT_STORAGE_KEY,
+    JSON.stringify(normalizeTitleFormatSettings(settings))
+  );
 }
 
 function normalizeForMatch(value: string): string {
@@ -194,6 +210,65 @@ export function compileInputTemplateRegex(inputTemplate: string): {
   }
 }
 
+function extractTypeAndNumber(source: string): {
+  courseType: string;
+  courseNumber: string;
+} {
+  const normalizedInput = source.replace(/_/g, ' ');
+  const typeMatch = normalizedInput.match(
+    /\b(CM|TD|TP|ED|Cours|Ron[eé]o|Fiche|Annale|S[eé]ance|Chapitre|Partiel|Examen|Colle|Tutorat)\b(?:\s*(?:n[°o.]?|#)?\s*(\d{1,3}[a-z]?))?/i
+  );
+
+  if (typeMatch) {
+    const rawType = typeMatch[1];
+    const upper = rawType.toUpperCase();
+    const courseType =
+      upper === 'CM' || upper === 'TD' || upper === 'TP' || upper === 'ED'
+        ? upper
+        : rawType.charAt(0).toUpperCase() + rawType.slice(1).toLowerCase();
+    let courseNumber = typeMatch[2] ?? '';
+    if (!courseNumber) {
+      const explicitNum = normalizedInput.match(/\bn[°o.]\s*(\d{1,3}[a-z]?)\b/i);
+      courseNumber = explicitNum?.[1] ?? '';
+    }
+    return {courseType, courseNumber};
+  }
+
+  const standaloneNum = normalizedInput.match(/\bn[°o.]\s*(\d{1,3}[a-z]?)\b/i);
+  return {
+    courseType: '',
+    courseNumber: standaloneNum?.[1] ?? '',
+  };
+}
+
+function applyDisplayFormatting(
+  text: string,
+  ext: string,
+  options: {
+    replaceUnderscoresWithSpaces?: boolean;
+    hideExtension?: boolean;
+    preserveExtensionBehavior?: boolean;
+  }
+): string {
+  const replaceUnderscores = options.replaceUnderscoresWithSpaces !== false;
+  const hideExtension = options.hideExtension !== false;
+
+  let out = text.trim();
+  if (replaceUnderscores) {
+    out = out.replace(/_/g, ' ').replace(/\s{2,}/g, ' ').trim();
+  }
+
+  if (options.preserveExtensionBehavior) {
+    if (hideExtension) {
+      out = stripSupportedExtension(out);
+    } else if (ext && !new RegExp(`\\.${escapeRegExp(ext)}$`, 'i').test(out)) {
+      out = `${out}.${ext}`;
+    }
+  }
+
+  return out;
+}
+
 function renderOutputTemplate(
   outputTemplate: string,
   values: {
@@ -201,23 +276,33 @@ function renderOutputTemplate(
     professor: string;
     rawTitle: string;
     originalWithoutExt: string;
+    courseType?: string;
+    courseNumber?: string;
+    ext?: string;
+    replaceUnderscoresWithSpaces?: boolean;
+    hideExtension?: boolean;
   }
 ): string {
   const tpl = outputTemplate.trim() || '{Titre}';
+  const replaceUnderscores = values.replaceUnderscoresWithSpaces !== false;
+  const formatPart = (part: string) =>
+    replaceUnderscores ? part.replace(/_/g, ' ').replace(/\s{2,}/g, ' ').trim() : part;
 
   const rendered = tpl.replace(/\{([^}]+)\}/g, (fullMatch, rawTag: string) => {
     const tag = canonicalizeTagName(rawTag);
     switch (tag) {
       case 'subject':
-        return values.subject;
+        return formatPart(values.subject);
       case 'professor':
-        return values.professor;
+        return formatPart(values.professor);
       case 'title':
-        return values.rawTitle || values.originalWithoutExt;
+        return formatPart(values.rawTitle || values.originalWithoutExt);
       case 'original':
-        return values.originalWithoutExt;
+        return formatPart(values.originalWithoutExt);
       case 'type':
+        return formatPart(values.courseType ?? '');
       case 'number':
+        return formatPart(values.courseNumber ?? '');
       case 'ignore':
         return '';
       default:
@@ -226,12 +311,20 @@ function renderOutputTemplate(
   });
 
   const cleaned = rendered
+    .replace(/[-–—:]\s*[-–—:]\s*/g, ' - ')
     .replace(/\s+[-–—:]\s*$/g, '')
     .replace(/^\s*[-–—:]\s+/g, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
 
-  return cleaned || values.originalWithoutExt;
+  const fallback = formatPart(values.originalWithoutExt);
+  const baseResult = cleaned || fallback;
+
+  return applyDisplayFormatting(baseResult, values.ext ?? '', {
+    replaceUnderscoresWithSpaces: replaceUnderscores,
+    hideExtension: values.hideExtension,
+    preserveExtensionBehavior: true,
+  });
 }
 
 function hasTokenMatch(haystackNorm: string, needleNorm: string): boolean {
@@ -368,22 +461,27 @@ export function parseCourseFilename(
   ueCode: string;
   subject: string;
   professor: string;
+  courseType: string;
+  courseNumber: string;
   rawTitle: string;
   displayTitle: string;
   targetName: string;
   matchedTemplate: boolean;
 } {
+  const normalizedFormat = normalizeTitleFormatSettings(titleFormat);
   const detectedExt = getCourseFileFormat(fileName, mimeType) ?? 'pdf';
   const withoutExt = stripSupportedExtension(fileName);
   const hasKnownExt = /\.(pdf|docx|odt)$/i.test(fileName.trim());
   const cleanFileName = hasKnownExt ? fileName.trim() : `${withoutExt}.${detectedExt}`;
 
-  const {regex, tags} = compileInputTemplateRegex(titleFormat.inputTemplate);
+  const {regex, tags} = compileInputTemplateRegex(normalizedFormat.inputTemplate);
   const match = regex ? withoutExt.trim().match(regex) : null;
 
   let subject = '';
   let professor = '';
   let rawTitle = '';
+  let capturedType = '';
+  let capturedNumber = '';
 
   if (match) {
     for (let i = 0; i < tags.length; i++) {
@@ -393,6 +491,10 @@ export function parseCourseFilename(
         subject = captured;
       } else if (tag === 'professor' && !professor) {
         professor = captured;
+      } else if (tag === 'type' && !capturedType) {
+        capturedType = captured;
+      } else if (tag === 'number' && !capturedNumber) {
+        capturedNumber = captured;
       } else if (tag === 'title') {
         rawTitle = rawTitle ? `${rawTitle} ${captured}` : captured;
       }
@@ -402,7 +504,12 @@ export function parseCourseFilename(
 
   let resolvedSubject = subject || 'Non classé';
   let resolvedProfessor = professor || 'Professeur non précisé';
+  // Never fall back to parent professor folder; use full filename without extension if {Titre} wasn't captured
   const resolvedTitle = rawTitle || cleanSegment(withoutExt);
+
+  const detectedMeta = extractTypeAndNumber(rawTitle || withoutExt);
+  const courseType = capturedType || detectedMeta.courseType;
+  const courseNumber = capturedNumber || detectedMeta.courseNumber;
 
   const activeRules = rules ?? loadSortRules();
   if (activeRules.length > 0) {
@@ -451,21 +558,27 @@ export function parseCourseFilename(
     }
   }
 
-  const displayTitle = renderOutputTemplate(titleFormat.outputTemplate, {
+  const displayTitle = renderOutputTemplate(normalizedFormat.outputTemplate, {
     subject: resolvedSubject,
     professor: resolvedProfessor,
     rawTitle: resolvedTitle,
     originalWithoutExt: withoutExt,
+    courseType,
+    courseNumber,
+    ext: detectedExt,
+    replaceUnderscoresWithSpaces: normalizedFormat.replaceUnderscoresWithSpaces,
+    hideExtension: normalizedFormat.hideExtension,
   });
 
-  const sanitizedDiskBase = displayTitle
+  const diskBaseCandidate = stripSupportedExtension(displayTitle);
+  const sanitizedDiskBase = diskBaseCandidate
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/^[.\s]+|[.\s]+$/g, '');
 
   const targetName =
-    titleFormat.renameOnDisk && sanitizedDiskBase
+    normalizedFormat.renameOnDisk && sanitizedDiskBase
       ? `${sanitizedDiskBase}.${detectedExt}`
       : cleanFileName;
 
@@ -473,6 +586,8 @@ export function parseCourseFilename(
     ueCode: '',
     subject: resolvedSubject,
     professor: resolvedProfessor,
+    courseType,
+    courseNumber,
     rawTitle: resolvedTitle,
     displayTitle,
     targetName,
@@ -482,7 +597,7 @@ export function parseCourseFilename(
 
 /**
  * Formats a course title synchronously for UI display (library list, tree, reader header)
- * without touching the filename on disk.
+ * using the actual file.name (never substituting parent folder professor name as document title).
  */
 export function formatCourseDisplayTitle(
   fileName: string,
@@ -494,9 +609,11 @@ export function formatCourseDisplayTitle(
     rules?: SortRule[];
   }
 ): string {
+  const normalizedFormat = normalizeTitleFormatSettings(titleFormat);
+  const detectedExt = getCourseFileFormat(fileName, overrides?.mimeType) ?? 'pdf';
   const parsed = parseCourseFilename(
     fileName,
-    titleFormat,
+    normalizedFormat,
     overrides?.mimeType,
     overrides?.rules
   );
@@ -516,11 +633,16 @@ export function formatCourseDisplayTitle(
       ? overrides.professor
       : parsed.professor;
 
-  return renderOutputTemplate(titleFormat.outputTemplate, {
+  return renderOutputTemplate(normalizedFormat.outputTemplate, {
     subject,
     professor,
-    rawTitle: parsed.rawTitle,
+    rawTitle: parsed.rawTitle || cleanSegment(withoutExt),
     originalWithoutExt: withoutExt,
+    courseType: parsed.courseType,
+    courseNumber: parsed.courseNumber,
+    ext: detectedExt,
+    replaceUnderscoresWithSpaces: normalizedFormat.replaceUnderscoresWithSpaces,
+    hideExtension: normalizedFormat.hideExtension,
   });
 }
 

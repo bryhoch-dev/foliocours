@@ -21,6 +21,7 @@ import type {
   CourseDocument,
   MobileTab,
   SearchResult,
+  SortRule,
   SubjectGroup,
   TitleFormatSettings,
 } from '../types/course';
@@ -43,6 +44,7 @@ import {
 import {PdfReaderPanel} from './PdfReaderPanel';
 import {PWAInstallButton} from './PWAInstallButton';
 import {FileFormatBadge, FileFormatIcon} from './FileFormatBadge';
+import {CourseTitleFormatSection} from './CourseTitleFormatSection';
 
 interface MobileWorkspaceProps {
   mode: AppMode;
@@ -73,6 +75,8 @@ interface MobileWorkspaceProps {
   onCloudIndexCleared: () => void;
   onNotify?: (text: string, tone?: 'info' | 'error') => void;
   titleFormat?: TitleFormatSettings;
+  rules?: SortRule[];
+  onChangeTitleFormat?: (settings: TitleFormatSettings) => void;
 }
 
 type MobileSortBy = 'name' | 'size' | 'recent';
@@ -134,6 +138,8 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
   onCloudIndexCleared,
   onNotify,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
+  rules,
+  onChangeTitleFormat,
 }) => {
   const [mobileTab, setMobileTab] = useState<MobileTab>('courses');
   const [selectedSubject, setSelectedSubject] = useState<string | null>(null);
@@ -886,6 +892,19 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
                 )}
               </div>
             </div>
+
+            {/* Course Title Display Format Settings (Mobile + Cloud Sync) */}
+            {onChangeTitleFormat && (
+              <div className="rounded-2xl border border-slate-800 bg-[#0F172A] p-4">
+                <CourseTitleFormatSection
+                  displayOnly
+                  value={titleFormat}
+                  onChange={onChangeTitleFormat}
+                  sampleFilename={documents[0]?.name ?? null}
+                  rules={rules}
+                />
+              </div>
+            )}
 
             {/* Cloud Offline Cache Status */}
             <div className="rounded-2xl border border-slate-800 bg-[#0F172A] p-4 space-y-2.5">

@@ -1,13 +1,19 @@
 import type {
+  CloudConfigPayload,
   CloudSearchIndexPayload,
   CourseDocument,
   DriveBackupPlan,
   DriveBackupPlanItem,
   DriveDeletePlanItem,
   DriveSyncRecord,
+  TitleFormatSettings,
 } from '../types/course';
 import {exportSearchIndexForCloud} from './db';
 import {getCourseFileFormat} from './fileFormats';
+import {
+  loadTitleFormatSettings,
+  normalizeTitleFormatSettings,
+} from './parser';
 
 const CLIENT_ID_STORAGE_KEY = 'foliocours_drive_client_id';
 const SYNC_CACHE_STORAGE_KEY = 'foliocours_drive_sync_cache';
@@ -15,6 +21,7 @@ const SESSION_STORAGE_KEY = 'foliocours_drive_session';
 const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 const ROOT_BACKUP_FOLDER_NAME = 'Sauvegarde_Cours';
 const SEARCH_INDEX_FILENAME = 'search_index.json';
+const CLOUD_CONFIG_FILENAME = 'config.json';
 
 export interface StoredDriveSession {
   accessToken: string;
@@ -378,6 +385,8 @@ export interface RemoteDriveInventory {
   duplicateFiles: RemoteDriveFileNode[];
   searchIndexFileId: string | null;
   searchIndexModifiedTime: string | null;
+  configFileId: string | null;
+  configModifiedTime: string | null;
 }
 
 export interface DriveMirrorAnalysisResult {
@@ -677,6 +686,8 @@ async function scanDriveBackupTree(
   const duplicateFiles: RemoteDriveFileNode[] = [];
   let searchIndexFileId: string | null = null;
   let searchIndexModifiedTime: string | null = null;
+  let configFileId: string | null = null;
+  let configModifiedTime: string | null = null;
 
   const rootNode: RemoteDriveFolderNode = {
     id: rootFolderId,
@@ -743,6 +754,12 @@ async function scanDriveBackupTree(
           parentNode.otherFileCount++;
           continue;
         }
+        if (parentNode.depth === 0 && entry.name === CLOUD_CONFIG_FILENAME) {
+          configFileId = entry.id;
+          configModifiedTime = entry.modifiedTime ?? null;
+          parentNode.otherFileCount++;
+          continue;
+        }
 
         const isCourseFile = getCourseFileFormat(entry.name, entry.mimeType) !== null;
         if (!isCourseFile) {
@@ -790,6 +807,8 @@ async function scanDriveBackupTree(
     duplicateFiles,
     searchIndexFileId,
     searchIndexModifiedTime,
+    configFileId,
+    configModifiedTime,
   };
 }
 
@@ -918,11 +937,15 @@ export async function executeDriveMirrorSync(
   analysis: DriveMirrorAnalysisResult,
   options?: {
     deleteObsolete?: boolean;
+    titleFormat?: TitleFormatSettings;
     onProgress?: (info: DriveMirrorProgress) => void;
   }
 ): Promise<DriveMirrorSyncResult> {
   const {plan, inventory} = analysis;
   const deleteObsolete = options?.deleteObsolete ?? true;
+  const activeTitleFormat = normalizeTitleFormatSettings(
+    options?.titleFormat ?? loadTitleFormatSettings()
+  );
   const onProgress = options?.onProgress;
 
   const syncCache = getDriveSyncCache();
@@ -1082,7 +1105,7 @@ export async function executeDriveMirrorSync(
     }
   }
 
-  // 4. Upload or update `search_index.json` at root of `Sauvegarde_Cours`
+  // 4. Upload or update `search_index.json` and `config.json` at root of `Sauvegarde_Cours`
   let indexUpdated = false;
   try {
     onProgress?.({
@@ -1091,7 +1114,11 @@ export async function executeDriveMirrorSync(
       total: 1,
       fileName: SEARCH_INDEX_FILENAME,
     });
-    const payload = await exportSearchIndexForCloud();
+    const basePayload = await exportSearchIndexForCloud();
+    const payload: CloudSearchIndexPayload = {
+      ...basePayload,
+      titleFormat: activeTitleFormat,
+    };
     const existingIndexId =
       inventory?.searchIndexFileId ??
       (await findExistingDriveFileInFolder(accessToken, SEARCH_INDEX_FILENAME, rootFolderId))
@@ -1110,8 +1137,28 @@ export async function executeDriveMirrorSync(
       );
       indexUpdated = true;
     }
+
+    const existingConfigId =
+      inventory?.configFileId ??
+      (await findExistingDriveFileInFolder(accessToken, CLOUD_CONFIG_FILENAME, rootFolderId))
+        ?.id;
+    const configPayload: CloudConfigPayload = {
+      version: 1,
+      updatedAt: Date.now(),
+      titleFormat: activeTitleFormat,
+    };
+    const configBlob = new Blob([JSON.stringify(configPayload)], {
+      type: 'application/json',
+    });
+    await uploadOrUpdateDriveBlob(
+      accessToken,
+      CLOUD_CONFIG_FILENAME,
+      configBlob,
+      rootFolderId,
+      existingConfigId
+    );
   } catch (err) {
-    console.warn('Impossible de téléverser search_index.json:', err);
+    console.warn('Impossible de téléverser search_index.json / config.json:', err);
   }
 
   return {uploaded, deleted, deletedFolders, indexUpdated};
@@ -1159,6 +1206,8 @@ export async function fetchCloudDriveLibrary(accessToken: string): Promise<{
   documents: CourseDocument[];
   searchIndexFileId: string | null;
   searchIndexModifiedTime: string | null;
+  configFileId: string | null;
+  configModifiedTime: string | null;
 }> {
   const rootFolderId = await findDriveFolder(accessToken, ROOT_BACKUP_FOLDER_NAME);
   if (!rootFolderId) {
@@ -1167,6 +1216,8 @@ export async function fetchCloudDriveLibrary(accessToken: string): Promise<{
       documents: [],
       searchIndexFileId: null,
       searchIndexModifiedTime: null,
+      configFileId: null,
+      configModifiedTime: null,
     };
   }
 
@@ -1187,6 +1238,7 @@ export async function fetchCloudDriveLibrary(accessToken: string): Promise<{
         ? 'Général'
         : dirSegments.slice(1).join(' / ');
 
+    // Always use actual Drive file.name (`remote.name`), never parent folder name
     docs.push({
       relativePath: remote.relativePath,
       name: remote.name,
@@ -1210,7 +1262,68 @@ export async function fetchCloudDriveLibrary(accessToken: string): Promise<{
     documents: docs,
     searchIndexFileId: inventory.searchIndexFileId,
     searchIndexModifiedTime: inventory.searchIndexModifiedTime,
+    configFileId: inventory.configFileId,
+    configModifiedTime: inventory.configModifiedTime,
   };
+}
+
+/**
+ * Downloads only the lightweight `config.json` file from Google Drive.
+ */
+export async function downloadCloudConfig(
+  accessToken: string,
+  fileId: string
+): Promise<CloudConfigPayload> {
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`,
+    {
+      headers: {Authorization: `Bearer ${accessToken}`},
+    }
+  );
+  if (res.status === 401) {
+    invalidateStoredAccessTokenKeepEmail();
+    throw new Error('Session Google expirée. Veuillez relancer l’action.');
+  }
+  if (!res.ok) {
+    throw new Error(`Impossible de télécharger config.json (${res.status}).`);
+  }
+  return (await res.json()) as CloudConfigPayload;
+}
+
+/**
+ * Uploads or updates `config.json` inside `Sauvegarde_Cours` on Google Drive
+ * so PC and Mobile stay synchronized on display formatting settings.
+ */
+export async function uploadCloudConfig(
+  accessToken: string,
+  titleFormat: TitleFormatSettings,
+  existingConfigFileId?: string | null
+): Promise<{id: string; modifiedTime?: string} | null> {
+  const rootFolderId = await findDriveFolder(accessToken, ROOT_BACKUP_FOLDER_NAME);
+  if (!rootFolderId) return null;
+
+  const targetId =
+    existingConfigFileId ??
+    (await findExistingDriveFileInFolder(accessToken, CLOUD_CONFIG_FILENAME, rootFolderId))
+      ?.id;
+
+  const configPayload: CloudConfigPayload = {
+    version: 1,
+    updatedAt: Date.now(),
+    titleFormat: normalizeTitleFormatSettings(titleFormat),
+  };
+
+  const blob = new Blob([JSON.stringify(configPayload)], {
+    type: 'application/json',
+  });
+
+  return uploadOrUpdateDriveBlob(
+    accessToken,
+    CLOUD_CONFIG_FILENAME,
+    blob,
+    rootFolderId,
+    targetId
+  );
 }
 
 /**

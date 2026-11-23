@@ -39,6 +39,7 @@ import {
 import {
   loadSortRules,
   loadTitleFormatSettings,
+  normalizeTitleFormatSettings,
   parseCourseFilename,
   saveSortRules,
   saveTitleFormatSettings,
@@ -48,6 +49,7 @@ import {indexDocumentsQueue} from './services/pdfEngine';
 import {
   analyzeDriveMirrorPlan,
   authenticateGoogleDrive,
+  downloadCloudConfig,
   downloadCloudSearchIndex,
   executeDriveMirrorSync,
   fetchCloudDriveLibrary,
@@ -55,6 +57,7 @@ import {
   getMemoryAccessToken,
   getSavedDriveClientId,
   getStoredDriveEmail,
+  uploadCloudConfig,
   type DriveMirrorAnalysisResult,
   type DriveMirrorProgress,
 } from './services/googleDrive';
@@ -70,6 +73,8 @@ import {DriveBackupConfirmModal} from './components/DriveBackupConfirmModal';
 import {FlattenFolderModal} from './components/FlattenFolderModal';
 import {RenameFolderModal, type RenameFolderTarget} from './components/RenameFolderModal';
 import {OfflineIndicator} from './components/OfflineIndicator';
+
+const CLOUD_CONFIG_MTIME_KEY = 'foliocours_cloud_config_mtime';
 
 function detectInitialMode(): AppMode {
   if (typeof window === 'undefined') return 'local';
@@ -121,6 +126,8 @@ export default function App() {
   cloudIndexRef.current = cloudIndex;
   const isCloudRefreshingRef = useRef(false);
   const lastAutoCloudRefreshAtRef = useRef(0);
+  const cloudConfigFileIdRef = useRef<string | null>(null);
+  const cloudConfigSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Navigation & Selection State
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('library');
@@ -189,6 +196,14 @@ export default function App() {
     const t = setTimeout(() => setToastMessage(null), 4500);
     return () => clearTimeout(t);
   }, [toastMessage]);
+
+  useEffect(() => {
+    return () => {
+      if (cloudConfigSyncTimerRef.current) {
+        clearTimeout(cloudConfigSyncTimerRef.current);
+      }
+    };
+  }, []);
 
   const activeDocuments = mode === 'cloud' ? cloudDocuments : localDocuments;
   const tree = useMemo(() => buildCourseTree(activeDocuments), [activeDocuments]);
@@ -445,11 +460,15 @@ export default function App() {
           documents: remoteDocs,
           searchIndexFileId,
           searchIndexModifiedTime,
+          configFileId,
+          configModifiedTime,
         } = libraryResult;
         setHasBackupFolder(folderExists);
+        cloudConfigFileIdRef.current = configFileId;
 
         let latestIndex = cloudIndexRef.current;
         let indexDownloadedFresh = false;
+        let configSynced = false;
         if (searchIndexFileId) {
           try {
             const remoteModifiedTime =
@@ -484,6 +503,39 @@ export default function App() {
           } catch (idxErr) {
             console.warn('Impossible de charger search_index.json:', idxErr);
           }
+        }
+
+        // Sync display format settings from Drive (config.json preferred, search_index.json fallback)
+        if (configFileId) {
+          try {
+            const remoteConfigMtime =
+              (await fetchDriveFileModifiedTime(token, configFileId)) ??
+              configModifiedTime;
+            const cachedConfigMtime = localStorage.getItem(CLOUD_CONFIG_MTIME_KEY);
+            const shouldDownloadConfig =
+              !cachedConfigMtime ||
+              (!!remoteConfigMtime && remoteConfigMtime !== cachedConfigMtime);
+
+            if (shouldDownloadConfig) {
+              const cloudCfg = await downloadCloudConfig(token, configFileId);
+              if (cloudCfg?.titleFormat) {
+                const normalizedFormat = normalizeTitleFormatSettings(cloudCfg.titleFormat);
+                setTitleFormat(normalizedFormat);
+                saveTitleFormatSettings(normalizedFormat);
+                configSynced = true;
+              }
+              if (remoteConfigMtime) {
+                localStorage.setItem(CLOUD_CONFIG_MTIME_KEY, remoteConfigMtime);
+              }
+            }
+          } catch (cfgErr) {
+            console.warn('Impossible de charger config.json:', cfgErr);
+          }
+        } else if (indexDownloadedFresh && latestIndex?.titleFormat) {
+          const normalizedFormat = normalizeTitleFormatSettings(latestIndex.titleFormat);
+          setTitleFormat(normalizedFormat);
+          saveTitleFormatSettings(normalizedFormat);
+          configSynced = true;
         }
 
         // Enrich page counts from search_index.json without downloading PDFs
@@ -526,7 +578,7 @@ export default function App() {
                 : ''
             }.`
           );
-        } else if (docsChanged || indexDownloadedFresh) {
+        } else if (docsChanged || indexDownloadedFresh || configSynced) {
           showToast(`Cloud Drive mis à jour (${enriched.length} cours).`);
         }
       } catch (err) {
@@ -997,31 +1049,69 @@ export default function App() {
     );
   };
 
-  const handleSaveTitleFormat = (nextFormat: TitleFormatSettings) => {
-    setTitleFormat(nextFormat);
-    saveTitleFormatSettings(nextFormat);
-    setImportQueue((prev) =>
-      prev.map((item) => {
-        if (item.status !== 'pending') return item;
-        const reparsed = parseCourseFilename(
-          item.originalName,
-          nextFormat,
-          undefined,
-          rules
-        );
-        return {
-          ...item,
-          ueCode: reparsed.ueCode,
-          subject: reparsed.subject,
-          professor: reparsed.professor,
-          targetName: reparsed.targetName,
-          displayTitle: reparsed.displayTitle,
-          matchedRulePattern: undefined,
-        };
-      })
-    );
-    showToast('Format et règles d’alias enregistrés.');
-  };
+  const handleSaveTitleFormat = useCallback(
+    (nextFormat: TitleFormatSettings, options?: {notify?: boolean}) => {
+      const normalized = normalizeTitleFormatSettings(nextFormat);
+      setTitleFormat(normalized);
+      saveTitleFormatSettings(normalized);
+      setImportQueue((prev) =>
+        prev.map((item) => {
+          if (item.status !== 'pending') return item;
+          const reparsed = parseCourseFilename(
+            item.originalName,
+            normalized,
+            undefined,
+            rules
+          );
+          return {
+            ...item,
+            ueCode: reparsed.ueCode,
+            subject: reparsed.subject,
+            professor: reparsed.professor,
+            targetName: reparsed.targetName,
+            displayTitle: reparsed.displayTitle,
+            matchedRulePattern: undefined,
+          };
+        })
+      );
+
+      if (options?.notify) {
+        showToast('Format et règles d’alias enregistrés.');
+      }
+
+      if (mode === 'cloud') {
+        if (cloudConfigSyncTimerRef.current) {
+          clearTimeout(cloudConfigSyncTimerRef.current);
+        }
+        cloudConfigSyncTimerRef.current = setTimeout(() => {
+          void (async () => {
+            try {
+              const clientId = getSavedDriveClientId().trim();
+              let token = getMemoryAccessToken();
+              if (!token && clientId && getStoredDriveEmail()) {
+                token = await authenticateGoogleDrive(clientId, {silentOnly: true});
+              }
+              if (!token) return;
+              const uploadedCfg = await uploadCloudConfig(
+                token,
+                normalized,
+                cloudConfigFileIdRef.current
+              );
+              if (uploadedCfg) {
+                cloudConfigFileIdRef.current = uploadedCfg.id;
+                if (uploadedCfg.modifiedTime) {
+                  localStorage.setItem(CLOUD_CONFIG_MTIME_KEY, uploadedCfg.modifiedTime);
+                }
+              }
+            } catch (err) {
+              console.warn('Synchronisation config.json Drive ignorée:', err);
+            }
+          })();
+        }, 600);
+      }
+    },
+    [mode, rules, showToast]
+  );
 
   const runDriveMirrorAnalysis = useCallback(async () => {
     const clientId = getSavedDriveClientId();
@@ -1087,6 +1177,7 @@ export default function App() {
       try {
         syncRes = await executeDriveMirrorSync(token, driveMirrorAnalysis, {
           deleteObsolete: true,
+          titleFormat,
           onProgress: setDriveUploadProgress,
         });
       } catch (err) {
@@ -1098,6 +1189,7 @@ export default function App() {
           token = await authenticateGoogleDrive(clientId);
           syncRes = await executeDriveMirrorSync(token, driveMirrorAnalysis, {
             deleteObsolete: true,
+            titleFormat,
             onProgress: setDriveUploadProgress,
           });
         } else {
@@ -1265,6 +1357,8 @@ export default function App() {
         readerJumpKey={readerJumpKey}
         highlightQuery={highlightQuery}
         titleFormat={titleFormat}
+        rules={rules}
+        onChangeTitleFormat={(next) => handleSaveTitleFormat(next)}
         onPageChange={setReaderPage}
         onOpenDocument={handleOpenDocument}
         onCloseDocument={handleCloseDocument}
@@ -1314,7 +1408,7 @@ export default function App() {
         titleFormat={titleFormat}
         sampleFilename={sampleFilename}
         onSaveRules={handleSaveRules}
-        onSaveTitleFormat={handleSaveTitleFormat}
+        onSaveTitleFormat={(next) => handleSaveTitleFormat(next, {notify: true})}
         onClose={() => setIsRulesModalOpen(false)}
       />
 
@@ -1325,7 +1419,7 @@ export default function App() {
         rules={rules}
         titleFormat={titleFormat}
         sampleFilename={sampleFilename}
-        onChangeTitleFormat={handleSaveTitleFormat}
+        onChangeTitleFormat={(next) => handleSaveTitleFormat(next)}
         onClose={() => setIsSettingsModalOpen(false)}
         onReindexAll={() => void handleReindexAll()}
         onClearIndex={async () => {

@@ -51,7 +51,14 @@ export interface CloudSearchIndexPayload {
   generatedAt: number;
   driveFileId?: string;
   driveModifiedTime?: string;
+  titleFormat?: TitleFormatSettings;
   documents: CloudSearchIndexDocument[];
+}
+
+export interface CloudConfigPayload {
+  version: 1;
+  updatedAt: number;
+  titleFormat: TitleFormatSettings;
 }
 
 export interface ProfessorGroup {
@@ -80,6 +87,8 @@ export interface TitleFormatSettings {
   inputTemplate: string;
   outputTemplate: string;
   renameOnDisk: boolean;
+  replaceUnderscoresWithSpaces?: boolean;
+  hideExtension?: boolean;
 }
 
 export interface ImportQueueItem {
