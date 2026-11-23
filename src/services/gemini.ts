@@ -5,7 +5,7 @@ import type {
 } from '../types/course';
 
 const GEMINI_API_KEY_STORAGE_KEY = 'foliocours_gemini_api_key';
-const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_MODEL = 'gemini-3.8-flash';
 const GEMINI_GENERATE_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 export class GeminiMissingKeyError extends Error {
