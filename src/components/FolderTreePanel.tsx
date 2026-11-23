@@ -1,5 +1,6 @@
 import React, {useMemo, useState} from 'react';
 import {
+  Brain,
   ChevronDown,
   ChevronRight,
   Cloud,
@@ -14,6 +15,7 @@ import type {
   AppMode,
   CourseDocument,
   IndexingProgress,
+  QuizFolderTarget,
   SortRule,
   SubjectGroup,
   TitleFormatSettings,
@@ -46,6 +48,7 @@ interface FolderTreePanelProps {
   onSelectScope: (subject: string | null, professor: string | null) => void;
   onOpenDocument: (doc: CourseDocument) => void;
   onRequestRenameFolder?: (target: RenameFolderTarget) => void;
+  onRequestFolderQuiz?: (target: QuizFolderTarget) => void;
   titleFormat?: TitleFormatSettings;
   rules?: SortRule[];
 }
@@ -71,6 +74,7 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
   onSelectScope,
   onOpenDocument,
   onRequestRenameFolder,
+  onRequestFolderQuiz,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
   rules,
 }) => {
@@ -406,6 +410,26 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
                     {subject.totalCount}
                   </span>
                 </button>
+                {onRequestFolderQuiz && subject.totalCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const docs = subject.professors.flatMap((p) => p.documents);
+                      onRequestFolderQuiz({
+                        kind: 'subject',
+                        title: subject.name,
+                        subjectName: subject.name,
+                        documents: docs,
+                      });
+                    }}
+                    title={`Quiz IA sur « ${subject.name} »`}
+                    aria-label={`Quiz IA sur le dossier ${subject.name}`}
+                    className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 p-1 rounded text-slate-400 hover:text-amber-300 hover:bg-slate-700/70 transition-opacity cursor-pointer shrink-0"
+                  >
+                    <Brain className="w-3 h-3" />
+                  </button>
+                )}
                 {canRenameSubject && (
                   <button
                     type="button"
@@ -479,6 +503,26 @@ export const FolderTreePanel: React.FC<FolderTreePanelProps> = ({
                               {prof.documents.length}
                             </span>
                           </button>
+                          {onRequestFolderQuiz && prof.documents.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onRequestFolderQuiz({
+                                  kind: 'professor',
+                                  title: `${subject.name} / ${prof.name}`,
+                                  subjectName: subject.name,
+                                  professorName: prof.name,
+                                  documents: prof.documents,
+                                });
+                              }}
+                              title={`Quiz IA sur « ${prof.name} »`}
+                              aria-label={`Quiz IA sur le dossier ${prof.name}`}
+                              className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 p-1 rounded text-slate-400 hover:text-amber-300 hover:bg-slate-700/70 transition-opacity cursor-pointer shrink-0"
+                            >
+                              <Brain className="w-3 h-3" />
+                            </button>
+                          )}
                           {canRenameProf && (
                             <button
                               type="button"

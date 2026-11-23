@@ -17,6 +17,7 @@ import {
 import type {AppMode, SortRule, TitleFormatSettings} from '../types/course';
 import {DEFAULT_TITLE_FORMAT_SETTINGS} from '../services/parser';
 import {CourseTitleFormatSection} from './CourseTitleFormatSection';
+import {GeminiApiKeySection} from './GeminiApiKeySection';
 import {PWAInstallButton} from './PWAInstallButton';
 
 interface SettingsAndDriveModalProps {
@@ -164,6 +165,11 @@ export const SettingsAndDriveModal: React.FC<SettingsAndDriveModalProps> = ({
               />
             </div>
           )}
+
+          {/* Google Gemini API Key Section */}
+          <div className="pb-5 border-b border-slate-800">
+            <GeminiApiKeySection />
+          </div>
 
           {/* Google Drive Client ID & OAuth Section */}
           <section className="space-y-3">

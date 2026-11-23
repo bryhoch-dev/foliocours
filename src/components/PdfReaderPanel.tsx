@@ -15,12 +15,18 @@ import {
   Maximize2,
   Minimize2,
   MoveHorizontal,
+  Search,
+  Sparkles,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
 import type {
+  AppMode,
+  CloudSearchIndexPayload,
   CourseDocument,
   CourseFileFormat,
+  GeminiChatTurn,
+  SearchResult,
   SortRule,
   TitleFormatSettings,
 } from '../types/course';
@@ -37,11 +43,14 @@ import {
 import {
   getCachedCloudFile,
   saveCachedCloudFile,
+  searchCloudIndexPayload,
+  searchIndexedLibrary,
 } from '../services/db';
 import {
   destroyPdfDocument,
   loadPdfDocumentFromBytes,
   loadPdfDocumentFromFile,
+  pdfjsLib,
 } from '../services/pdfEngine';
 import {
   extractDocxTextLowRam,
@@ -57,7 +66,15 @@ import {
   getMemoryAccessToken,
   getSavedDriveClientId,
 } from '../services/googleDrive';
+import {
+  askGeminiSelectionExplain,
+  isGeminiMissingKeyError,
+} from '../services/gemini';
 import {FileFormatBadge} from './FileFormatBadge';
+import {
+  ReaderAssistantDrawer,
+  type AssistantDrawerMode,
+} from './ReaderAssistantDrawer';
 
 if (typeof window !== 'undefined' && !(window as unknown as {JSZip?: typeof JSZip}).JSZip) {
   (window as unknown as {JSZip?: typeof JSZip}).JSZip = JSZip;
@@ -65,12 +82,17 @@ if (typeof window !== 'undefined' && !(window as unknown as {JSZip?: typeof JSZi
 
 interface PdfReaderPanelProps {
   document: CourseDocument | null;
+  mode?: AppMode;
+  allDocuments?: CourseDocument[];
+  cloudIndex?: CloudSearchIndexPayload | null;
   targetPage: number;
   jumpKey?: number;
   highlightQuery: string;
   titleFormat?: TitleFormatSettings;
   rules?: SortRule[];
   onPageChange: (page: number) => void;
+  onOpenDocument?: (doc: CourseDocument, page?: number, query?: string) => void;
+  onOpenSettings?: () => void;
   onCloseMobile?: () => void;
   onNotify?: (text: string, tone?: 'info' | 'error') => void;
 }
@@ -127,7 +149,9 @@ const PdfPageSlot: React.FC<PdfPageSlotProps> = React.memo(
   }) => {
     const slotRef = useRef<HTMLDivElement | null>(null);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const textLayerRef = useRef<HTMLDivElement | null>(null);
     const renderTaskRef = useRef<RenderTask | null>(null);
+    const textLayerInstanceRef = useRef<pdfjsLib.TextLayer | null>(null);
     const renderedScaleRef = useRef<number | null>(null);
     const [hasDrawn, setHasDrawn] = useState(false);
 
@@ -159,6 +183,17 @@ const PdfPageSlot: React.FC<PdfPageSlotProps> = React.memo(
           }
           renderTaskRef.current = null;
         }
+        if (textLayerInstanceRef.current) {
+          try {
+            textLayerInstanceRef.current.cancel();
+          } catch {
+            // ignore
+          }
+          textLayerInstanceRef.current = null;
+        }
+        if (textLayerRef.current) {
+          textLayerRef.current.innerHTML = '';
+        }
         if (canvasRef.current) {
           canvasRef.current.width = 0;
           canvasRef.current.height = 0;
@@ -183,6 +218,14 @@ const PdfPageSlot: React.FC<PdfPageSlotProps> = React.memo(
             // ignore
           }
           renderTaskRef.current = null;
+        }
+        if (textLayerInstanceRef.current) {
+          try {
+            textLayerInstanceRef.current.cancel();
+          } catch {
+            // ignore
+          }
+          textLayerInstanceRef.current = null;
         }
 
         const page = await pdf.getPage(pageNumber);
@@ -237,6 +280,26 @@ const PdfPageSlot: React.FC<PdfPageSlotProps> = React.memo(
 
           renderedScaleRef.current = scale;
           setHasDrawn(true);
+
+          const textLayerEl = textLayerRef.current;
+          if (textLayerEl && !cancelled) {
+            textLayerEl.innerHTML = '';
+            textLayerEl.style.setProperty('--total-scale-factor', String(scale));
+            const textLayer = new pdfjsLib.TextLayer({
+              textContentSource: page.streamTextContent(),
+              container: textLayerEl,
+              viewport,
+            });
+            textLayerInstanceRef.current = textLayer;
+            try {
+              await textLayer.render();
+            } catch (tlErr: unknown) {
+              const tlName = (tlErr as {name?: string})?.name;
+              if (tlName !== 'AbortException' && !cancelled) {
+                console.warn(`TextLayer ignoré page ${pageNumber}:`, tlErr);
+              }
+            }
+          }
         } catch (err: unknown) {
           const name = (err as {name?: string})?.name;
           if (name !== 'RenderingCancelledException' && !cancelled) {
@@ -272,11 +335,27 @@ const PdfPageSlot: React.FC<PdfPageSlotProps> = React.memo(
           }
           renderTaskRef.current = null;
         }
+        if (textLayerInstanceRef.current) {
+          try {
+            textLayerInstanceRef.current.cancel();
+          } catch {
+            // ignore
+          }
+          textLayerInstanceRef.current = null;
+        }
       };
     }, [shouldRender, pdf, pageNumber, scale]);
 
     useEffect(() => {
       return () => {
+        if (textLayerInstanceRef.current) {
+          try {
+            textLayerInstanceRef.current.cancel();
+          } catch {
+            // ignore
+          }
+          textLayerInstanceRef.current = null;
+        }
         if (canvasRef.current) {
           canvasRef.current.width = 0;
           canvasRef.current.height = 0;
@@ -288,13 +367,16 @@ const PdfPageSlot: React.FC<PdfPageSlotProps> = React.memo(
       <div
         ref={setRefs}
         data-page={pageNumber}
-        className="relative mx-auto shrink-0 rounded-sm shadow-2xl border border-slate-800/90 bg-white overflow-hidden select-none"
+        className="relative mx-auto shrink-0 rounded-sm shadow-2xl border border-slate-800/90 bg-white overflow-hidden select-text"
       >
         {shouldRender ? (
-          <canvas ref={canvasRef} className="block w-full h-full" />
+          <>
+            <canvas ref={canvasRef} className="block w-full h-full" />
+            <div ref={textLayerRef} className="textLayer" />
+          </>
         ) : null}
         {!hasDrawn && (
-          <div className="absolute inset-0 flex items-center justify-center bg-slate-100 text-slate-400 font-mono text-xs pointer-events-none">
+          <div className="absolute inset-0 flex items-center justify-center bg-slate-100 text-slate-400 font-mono text-xs pointer-events-none select-none">
             Page {pageNumber}
           </div>
         )}
@@ -621,17 +703,23 @@ function renderSafeMammothHtml(html: string): React.ReactNode {
 
 export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   document: courseDoc,
+  mode = 'local',
+  allDocuments = [],
+  cloudIndex = null,
   targetPage,
   jumpKey,
   highlightQuery,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
   rules,
   onPageChange,
+  onOpenDocument,
+  onOpenSettings,
   onCloseMobile,
   onNotify,
 }) => {
   const readerRootRef = useRef<HTMLElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const floatingMenuRef = useRef<HTMLDivElement>(null);
   const pdfInstanceRef = useRef<PDFDocumentProxy | null>(null);
   const pageSlotRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const visibleMetricsRef = useRef<Map<number, number>>(new Map());
@@ -688,6 +776,28 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
 
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Selection floating context bar & Assistant drawer (Explain AI + Search in courses)
+  const [selectionMenu, setSelectionMenu] = useState<{
+    text: string;
+    left: number;
+    top: number;
+    placement: 'above' | 'below';
+  } | null>(null);
+  const selectionDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerMode, setDrawerMode] = useState<AssistantDrawerMode>('explain');
+  const [drawerSelection, setDrawerSelection] = useState('');
+  const [chatHistory, setChatHistory] = useState<GeminiChatTurn[]>([]);
+  const [isExplaining, setIsExplaining] = useState(false);
+  const [explainError, setExplainError] = useState<string | null>(null);
+  const [isMissingApiKey, setIsMissingApiKey] = useState(false);
+  const explainAbortRef = useRef<AbortController | null>(null);
+
+  const [drawerSearchResults, setDrawerSearchResults] = useState<SearchResult[]>([]);
+  const [isDrawerSearching, setIsDrawerSearching] = useState(false);
+  const searchLookupSeqRef = useRef(0);
 
   const registerSlot = useCallback((pageNum: number, el: HTMLDivElement | null) => {
     if (el) {
@@ -1680,6 +1790,239 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     }
   };
 
+  // Reset floating menu and cancel active explain request when switching documents
+  useEffect(() => {
+    setSelectionMenu(null);
+    explainAbortRef.current?.abort();
+    explainAbortRef.current = null;
+    setIsExplaining(false);
+  }, [courseDoc]);
+
+  useEffect(() => {
+    return () => {
+      if (selectionDebounceRef.current) {
+        clearTimeout(selectionDebounceRef.current);
+      }
+      explainAbortRef.current?.abort();
+    };
+  }, []);
+
+  const evaluateSelectionInReader = useCallback(() => {
+    const container = containerRef.current;
+    const sel = window.getSelection();
+    if (!container || !sel || sel.rangeCount === 0 || sel.isCollapsed) {
+      setSelectionMenu(null);
+      return;
+    }
+
+    const anchorNode = sel.anchorNode;
+    const focusNode = sel.focusNode;
+    if (
+      !anchorNode ||
+      !focusNode ||
+      !container.contains(anchorNode) ||
+      !container.contains(focusNode)
+    ) {
+      return;
+    }
+
+    const normalizedText = sel.toString().replace(/\s+/g, ' ').trim();
+    if (normalizedText.length < 2 || normalizedText.length > 500) {
+      setSelectionMenu(null);
+      return;
+    }
+
+    const range = sel.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      setSelectionMenu(null);
+      return;
+    }
+
+    const viewportW = window.innerWidth;
+    const viewportH = window.innerHeight;
+    const halfMenuW = Math.min(165, Math.floor((viewportW - 24) / 2));
+    const centerX = rect.left + rect.width / 2;
+    const clampedLeft = Math.max(
+      halfMenuW + 12,
+      Math.min(viewportW - halfMenuW - 12, centerX)
+    );
+
+    const placeBelow = rect.top < 78;
+    const rawTop = placeBelow ? rect.bottom + 10 : rect.top - 10;
+    const clampedTop = Math.max(12, Math.min(viewportH - 58, rawTop));
+
+    setSelectionMenu({
+      text: normalizedText,
+      left: Math.round(clampedLeft),
+      top: Math.round(clampedTop),
+      placement: placeBelow ? 'below' : 'above',
+    });
+  }, []);
+
+  // Listen to mouseup & debounced selectionchange (250ms for touch selection)
+  useEffect(() => {
+    if (!courseDoc || !hasLoadedContent) {
+      setSelectionMenu(null);
+      return;
+    }
+
+    const handleMouseUp = () => {
+      requestAnimationFrame(() => evaluateSelectionInReader());
+    };
+
+    const handleSelectionChange = () => {
+      if (selectionDebounceRef.current) {
+        clearTimeout(selectionDebounceRef.current);
+      }
+      selectionDebounceRef.current = setTimeout(() => {
+        evaluateSelectionInReader();
+      }, 250);
+    };
+
+    const container = containerRef.current;
+    container?.addEventListener('mouseup', handleMouseUp);
+    window.document.addEventListener('selectionchange', handleSelectionChange);
+    return () => {
+      container?.removeEventListener('mouseup', handleMouseUp);
+      window.document.removeEventListener('selectionchange', handleSelectionChange);
+      if (selectionDebounceRef.current) {
+        clearTimeout(selectionDebounceRef.current);
+        selectionDebounceRef.current = null;
+      }
+    };
+  }, [courseDoc, hasLoadedContent, evaluateSelectionInReader]);
+
+  // Synchronize floating menu coordinates cleanly via DOM refs
+  useLayoutEffect(() => {
+    const el = floatingMenuRef.current;
+    if (!el || !selectionMenu) return;
+    el.style.left = `${selectionMenu.left}px`;
+    el.style.top = `${selectionMenu.top}px`;
+    el.style.transform =
+      selectionMenu.placement === 'above'
+        ? 'translate(-50%, -100%)'
+        : 'translate(-50%, 0)';
+  }, [selectionMenu]);
+
+  const runSearchForSelection = useCallback(
+    async (queryText: string) => {
+      const seq = ++searchLookupSeqRef.current;
+      setIsDrawerSearching(true);
+      setDrawerSearchResults([]);
+      try {
+        const hits =
+          mode === 'cloud'
+            ? searchCloudIndexPayload(cloudIndex, queryText, allDocuments, 40)
+            : await searchIndexedLibrary(queryText, 40);
+        if (searchLookupSeqRef.current === seq) {
+          setDrawerSearchResults(hits);
+        }
+      } finally {
+        if (searchLookupSeqRef.current === seq) {
+          setIsDrawerSearching(false);
+        }
+      }
+    },
+    [mode, cloudIndex, allDocuments]
+  );
+
+  const runExplainForSelection = useCallback(
+    async (
+      snippet: string,
+      priorHistory: GeminiChatTurn[],
+      followUp?: string
+    ) => {
+      if (!courseDoc) return;
+      explainAbortRef.current?.abort();
+      const controller = new AbortController();
+      explainAbortRef.current = controller;
+
+      const displayTitle = formatCourseDisplayTitle(courseDoc.name, titleFormat, {
+        subject: courseDoc.subject,
+        professor: courseDoc.professor,
+        rules,
+      });
+
+      const userTurnText = followUp?.trim()
+        ? followUp.trim()
+        : `Expliquer : ${snippet}`;
+      const nextHistory: GeminiChatTurn[] = [
+        ...priorHistory,
+        {role: 'user', text: userTurnText},
+      ];
+      setChatHistory(nextHistory);
+      setIsExplaining(true);
+      setExplainError(null);
+      setIsMissingApiKey(false);
+
+      try {
+        const answer = await askGeminiSelectionExplain({
+          selectedText: snippet,
+          courseContext: {
+            displayTitle,
+            fileName: courseDoc.name,
+            subject: courseDoc.subject,
+            professor: courseDoc.professor,
+          },
+          history: priorHistory,
+          followUpQuestion: followUp,
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
+        setChatHistory((prev) => [...prev, {role: 'model', text: answer}]);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        setIsMissingApiKey(isGeminiMissingKeyError(err));
+        setExplainError(
+          err instanceof Error
+            ? err.message
+            : 'Erreur lors de la demande d’explication Gemini.'
+        );
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsExplaining(false);
+        }
+      }
+    },
+    [courseDoc, titleFormat, rules]
+  );
+
+  const handleActionExplainSelection = () => {
+    if (!selectionMenu) return;
+    const text = selectionMenu.text;
+    setSelectionMenu(null);
+    setDrawerSelection(text);
+    setDrawerMode('explain');
+    setDrawerOpen(true);
+    void runExplainForSelection(text, []);
+  };
+
+  const handleActionSearchSelection = () => {
+    if (!selectionMenu) return;
+    const text = selectionMenu.text;
+    setSelectionMenu(null);
+    setDrawerSelection(text);
+    setDrawerMode('search');
+    setDrawerOpen(true);
+    void runSearchForSelection(text);
+  };
+
+  const handleSwitchDrawerMode = (nextMode: AssistantDrawerMode) => {
+    setDrawerMode(nextMode);
+    if (nextMode === 'search' && drawerSelection && drawerSearchResults.length === 0 && !isDrawerSearching) {
+      void runSearchForSelection(drawerSelection);
+    } else if (
+      nextMode === 'explain' &&
+      drawerSelection &&
+      chatHistory.length === 0 &&
+      !isExplaining &&
+      !explainError
+    ) {
+      void runExplainForSelection(drawerSelection, []);
+    }
+  };
+
   const driveFolderUrl = (() => {
     const id = courseDoc?.driveParentFolderId?.trim();
     if (id && /^[A-Za-z0-9_-]+$/.test(id)) {
@@ -1917,112 +2260,170 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
         </div>
       )}
 
-      {/* Viewport */}
-      <div
-        ref={containerRef}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-        className={`relative flex-1 overflow-auto p-3 md:p-6 flex flex-col gap-4 touch-pan-x touch-pan-y ${
-          docFormat === 'pdf' ? '' : 'bg-[#DCE1E8]'
-        }`}
-      >
-        {isLoading ? (
-          <div className="my-auto text-center space-y-2 px-4">
-            <p
-              className={`text-xs ${
-                docFormat === 'pdf' ? 'text-slate-300' : 'text-slate-700 font-medium'
-              }`}
-            >
-              {courseDoc.source === 'cloud'
-                ? 'Récupération à la demande depuis Google Drive…'
-                : 'Chargement du document…'}
-            </p>
-            <p
-              className={`text-[11px] ${
-                docFormat === 'pdf' ? 'text-slate-500' : 'text-slate-600'
-              }`}
-            >
-              Aucun stockage permanent utilisé sur l’appareil.
-            </p>
-          </div>
-        ) : error ? (
-          <div className="my-auto mx-auto max-w-md rounded-lg border border-rose-500/40 bg-rose-950/90 p-4 text-xs text-rose-200">
-            {error}
-          </div>
-        ) : docFormat === 'pdf' ? (
-          pageDimensions.map((dim, idx) => {
-            const pageNum = idx + 1;
-            const shouldRender =
-              pageNum >= renderRange[0] && pageNum <= renderRange[1];
-            return (
-              <PdfPageSlot
-                key={`${courseDoc.relativePath}-${pageNum}`}
-                pageNumber={pageNum}
-                unscaledWidth={dim.width}
-                unscaledHeight={dim.height}
-                scale={scale}
-                shouldRender={shouldRender}
-                pdf={pdfDoc}
-                registerSlot={registerSlot}
-              />
-            );
-          })
-        ) : (
-          /* A4 Light-Gray Paper Viewport for .docx and .odt */
-          <div ref={officeSpacerRef} className="relative mx-auto shrink-0">
-            <div ref={officeInnerRef} className="origin-top-left inline-block w-max min-w-[320px]">
-              {docFormat === 'docx' ? (
-                docxFallbackHtml !== null ? (
-                  <article className="w-[794px] min-h-[1123px] bg-white text-slate-900 px-12 py-12 md:px-14 md:py-14 shadow-2xl border border-slate-300/90 space-y-4">
-                    <div className="rounded-md border border-rose-300 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-900 space-y-1">
-                      <p className="font-semibold">
-                        Aperçu avancé (docx-preview) indisponible — Mode de secours Mammoth actif
-                      </p>
-                      {docxPreviewError && (
-                        <p className="font-mono text-[11px] text-rose-800 break-words">
-                          Erreur : {docxPreviewError}
-                        </p>
-                      )}
-                    </div>
-                    <div className="space-y-2">{renderSafeMammothHtml(docxFallbackHtml)}</div>
-                  </article>
-                ) : docxFallbackText !== null ? (
-                  <article className="w-[794px] min-h-[1123px] bg-white text-slate-900 px-12 py-12 md:px-14 md:py-14 shadow-2xl border border-slate-300/90 space-y-4">
-                    <div className="rounded-md border border-rose-300 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-900 space-y-1">
-                      <p className="font-semibold">
-                        Affichage simplifié en texte brut (docx-preview et Mammoth n’ont pas pu rendre la mise en page)
-                      </p>
-                      {docxPreviewError && (
-                        <p className="font-mono text-[11px] text-rose-800 break-words">
-                          Erreur : {docxPreviewError}
-                        </p>
-                      )}
-                    </div>
-                    {docxFallbackText.split(/\n{2,}/).map((para, idx) => (
-                      <p key={idx} className="text-[14.5px] leading-relaxed text-slate-800 whitespace-pre-wrap">
-                        {para}
-                      </p>
-                    ))}
-                  </article>
-                ) : (
-                  <div ref={docxContainerRef} className="docx-reader-host" />
-                )
-              ) : odtDoc ? (
-                <article className="w-[794px] min-h-[1123px] bg-white text-slate-900 px-12 py-12 md:px-14 md:py-14 shadow-2xl border border-slate-300/90">
-                  {odtDoc.blocks.length === 0 ? (
-                    <p className="text-sm text-slate-500 italic">
-                      Document texte vide.
-                    </p>
-                  ) : (
-                    odtDoc.blocks.map((block, i) => renderOdtBlock(block, i))
-                  )}
-                </article>
-              ) : null}
+      {/* Viewport + Non-blocking Assistant Drawer */}
+      <div className="flex-1 flex flex-col md:flex-row min-h-0 min-w-0 relative overflow-hidden">
+        <div
+          ref={containerRef}
+          onScroll={() => {
+            if (selectionMenu) setSelectionMenu(null);
+          }}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+          className={`relative flex-1 overflow-auto p-3 md:p-6 flex flex-col gap-4 touch-pan-x touch-pan-y select-text min-w-0 ${
+            docFormat === 'pdf' ? '' : 'bg-[#DCE1E8]'
+          }`}
+        >
+          {isLoading ? (
+            <div className="my-auto text-center space-y-2 px-4">
+              <p
+                className={`text-xs ${
+                  docFormat === 'pdf' ? 'text-slate-300' : 'text-slate-700 font-medium'
+                }`}
+              >
+                {courseDoc.source === 'cloud'
+                  ? 'Récupération à la demande depuis Google Drive…'
+                  : 'Chargement du document…'}
+              </p>
+              <p
+                className={`text-[11px] ${
+                  docFormat === 'pdf' ? 'text-slate-500' : 'text-slate-600'
+                }`}
+              >
+                Aucun stockage permanent utilisé sur l’appareil.
+              </p>
             </div>
-          </div>
-        )}
+          ) : error ? (
+            <div className="my-auto mx-auto max-w-md rounded-lg border border-rose-500/40 bg-rose-950/90 p-4 text-xs text-rose-200">
+              {error}
+            </div>
+          ) : docFormat === 'pdf' ? (
+            pageDimensions.map((dim, idx) => {
+              const pageNum = idx + 1;
+              const shouldRender =
+                pageNum >= renderRange[0] && pageNum <= renderRange[1];
+              return (
+                <PdfPageSlot
+                  key={`${courseDoc.relativePath}-${pageNum}`}
+                  pageNumber={pageNum}
+                  unscaledWidth={dim.width}
+                  unscaledHeight={dim.height}
+                  scale={scale}
+                  shouldRender={shouldRender}
+                  pdf={pdfDoc}
+                  registerSlot={registerSlot}
+                />
+              );
+            })
+          ) : (
+            /* A4 Light-Gray Paper Viewport for .docx and .odt */
+            <div ref={officeSpacerRef} className="relative mx-auto shrink-0 select-text">
+              <div ref={officeInnerRef} className="origin-top-left inline-block w-max min-w-[320px] select-text">
+                {docFormat === 'docx' ? (
+                  docxFallbackHtml !== null ? (
+                    <article className="w-[794px] min-h-[1123px] bg-white text-slate-900 px-12 py-12 md:px-14 md:py-14 shadow-2xl border border-slate-300/90 space-y-4">
+                      <div className="rounded-md border border-rose-300 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-900 space-y-1">
+                        <p className="font-semibold">
+                          Aperçu avancé (docx-preview) indisponible — Mode de secours Mammoth actif
+                        </p>
+                        {docxPreviewError && (
+                          <p className="font-mono text-[11px] text-rose-800 break-words">
+                            Erreur : {docxPreviewError}
+                          </p>
+                        )}
+                      </div>
+                      <div className="space-y-2">{renderSafeMammothHtml(docxFallbackHtml)}</div>
+                    </article>
+                  ) : docxFallbackText !== null ? (
+                    <article className="w-[794px] min-h-[1123px] bg-white text-slate-900 px-12 py-12 md:px-14 md:py-14 shadow-2xl border border-slate-300/90 space-y-4">
+                      <div className="rounded-md border border-rose-300 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-900 space-y-1">
+                        <p className="font-semibold">
+                          Affichage simplifié en texte brut (docx-preview et Mammoth n’ont pas pu rendre la mise en page)
+                        </p>
+                        {docxPreviewError && (
+                          <p className="font-mono text-[11px] text-rose-800 break-words">
+                            Erreur : {docxPreviewError}
+                          </p>
+                        )}
+                      </div>
+                      {docxFallbackText.split(/\n{2,}/).map((para, idx) => (
+                        <p key={idx} className="text-[14.5px] leading-relaxed text-slate-800 whitespace-pre-wrap">
+                          {para}
+                        </p>
+                      ))}
+                    </article>
+                  ) : (
+                    <div ref={docxContainerRef} className="docx-reader-host select-text" />
+                  )
+                ) : odtDoc ? (
+                  <article className="w-[794px] min-h-[1123px] bg-white text-slate-900 px-12 py-12 md:px-14 md:py-14 shadow-2xl border border-slate-300/90 select-text">
+                    {odtDoc.blocks.length === 0 ? (
+                      <p className="text-sm text-slate-500 italic">
+                        Document texte vide.
+                      </p>
+                    ) : (
+                      odtDoc.blocks.map((block, i) => renderOdtBlock(block, i))
+                    )}
+                  </article>
+                ) : null}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <ReaderAssistantDrawer
+          isOpen={drawerOpen}
+          drawerMode={drawerMode}
+          selectedText={drawerSelection}
+          chatHistory={chatHistory}
+          isExplaining={isExplaining}
+          explainError={explainError}
+          isMissingApiKey={isMissingApiKey}
+          onAskFollowUp={(q) => {
+            void runExplainForSelection(drawerSelection, chatHistory, q);
+          }}
+          onSwitchMode={handleSwitchDrawerMode}
+          onOpenSettings={onOpenSettings}
+          searchResults={drawerSearchResults}
+          isSearching={isDrawerSearching}
+          allDocuments={allDocuments}
+          titleFormat={titleFormat}
+          rules={rules}
+          onSelectSearchResult={(doc, page, query) => {
+            onOpenDocument?.(doc, page, query);
+          }}
+          onClose={() => {
+            explainAbortRef.current?.abort();
+            setDrawerOpen(false);
+          }}
+        />
       </div>
+
+      {/* Floating Selection Context Bar */}
+      {selectionMenu && (
+        <div
+          ref={floatingMenuRef}
+          onMouseDown={(e) => e.preventDefault()}
+          className="fixed z-50 inline-flex items-center gap-1 rounded-xl border border-slate-700 bg-[#0F172A]/95 p-1 shadow-2xl backdrop-blur-md max-w-[calc(100vw-24px)]"
+        >
+          <button
+            type="button"
+            onClick={handleActionExplainSelection}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-2.5 py-1.5 text-xs font-semibold text-slate-950 hover:bg-amber-400 transition-colors cursor-pointer whitespace-nowrap"
+          >
+            <Sparkles className="w-3.5 h-3.5 shrink-0" />
+            <span>Expliquer (IA)</span>
+          </button>
+          <button
+            type="button"
+            onClick={handleActionSearchSelection}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800/90 px-2.5 py-1.5 text-xs font-medium text-slate-100 hover:bg-slate-700 transition-colors cursor-pointer whitespace-nowrap"
+          >
+            <Search className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span>Chercher dans mes cours</span>
+          </button>
+        </div>
+      )}
     </main>
   );
 };

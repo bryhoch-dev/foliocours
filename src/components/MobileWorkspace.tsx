@@ -2,6 +2,7 @@ import React, {useEffect, useMemo, useState} from 'react';
 import {
   ArrowLeft,
   BookOpen,
+  Brain,
   Check,
   ChevronRight,
   Cloud,
@@ -20,6 +21,7 @@ import type {
   CloudSearchIndexPayload,
   CourseDocument,
   MobileTab,
+  QuizFolderTarget,
   SearchResult,
   SortRule,
   SubjectGroup,
@@ -45,6 +47,7 @@ import {PdfReaderPanel} from './PdfReaderPanel';
 import {PWAInstallButton} from './PWAInstallButton';
 import {FileFormatBadge, FileFormatIcon} from './FileFormatBadge';
 import {CourseTitleFormatSection} from './CourseTitleFormatSection';
+import {GeminiApiKeySection} from './GeminiApiKeySection';
 
 interface MobileWorkspaceProps {
   mode: AppMode;
@@ -77,6 +80,7 @@ interface MobileWorkspaceProps {
   titleFormat?: TitleFormatSettings;
   rules?: SortRule[];
   onChangeTitleFormat?: (settings: TitleFormatSettings) => void;
+  onRequestFolderQuiz?: (target: QuizFolderTarget) => void;
 }
 
 type MobileSortBy = 'name' | 'size' | 'recent';
@@ -140,6 +144,7 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
   rules,
   onChangeTitleFormat,
+  onRequestFolderQuiz,
 }) => {
   const [mobileTab, setMobileTab] = useState<MobileTab>('courses');
   const [selectedSubject, setSelectedSubject] = useState<string | null>(null);
@@ -246,12 +251,20 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
       <div className="md:hidden fixed inset-0 z-40 flex flex-col bg-[#070B14]">
         <PdfReaderPanel
           document={activeDoc}
+          mode={mode}
+          allDocuments={documents}
+          cloudIndex={cloudIndex}
           targetPage={readerPage}
           jumpKey={readerJumpKey}
           highlightQuery={highlightQuery}
           titleFormat={titleFormat}
           rules={rules}
           onPageChange={onPageChange}
+          onOpenDocument={onOpenDocument}
+          onOpenSettings={() => {
+            onCloseDocument();
+            setMobileTab('sync');
+          }}
           onCloseMobile={onCloseDocument}
           onNotify={onNotify}
         />
@@ -460,13 +473,15 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
                   </div>
                 ) : (
                   tree.map((subject) => (
-                    <button
+                    <div
                       key={subject.name}
-                      type="button"
-                      onClick={() => setSelectedSubject(subject.name)}
-                      className="w-full min-h-[60px] px-4 py-3 flex items-center justify-between gap-3 active:bg-slate-800/70 transition-colors text-left cursor-pointer"
+                      className="flex items-center justify-between gap-2 px-4 py-2 min-h-[60px]"
                     >
-                      <div className="flex items-center gap-3 min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedSubject(subject.name)}
+                        className="flex-1 min-w-0 flex items-center gap-3 active:bg-slate-800/70 rounded-lg py-1 text-left cursor-pointer"
+                      >
                         <div className="w-9 h-9 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-center shrink-0">
                           <Folder className="w-4 h-4 text-amber-400" />
                         </div>
@@ -475,12 +490,38 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
                             {subject.name}
                           </p>
                           <p className="text-xs text-slate-400 font-mono tabular-nums mt-0.5">
-                            {subject.professors.length} prof. · {subject.totalCount} PDF
+                            {subject.professors.length} prof. · {subject.totalCount} fichiers
                           </p>
                         </div>
-                      </div>
-                      <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
-                    </button>
+                      </button>
+                      {onRequestFolderQuiz && subject.totalCount > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const docs = subject.professors.flatMap((p) => p.documents);
+                            onRequestFolderQuiz({
+                              kind: 'subject',
+                              title: subject.name,
+                              subjectName: subject.name,
+                              documents: docs,
+                            });
+                          }}
+                          aria-label={`Quiz IA sur ${subject.name}`}
+                          title={`Quiz IA sur ${subject.name}`}
+                          className="min-h-[38px] min-w-[38px] rounded-lg border border-slate-800 bg-slate-900/70 flex items-center justify-center text-slate-400 active:text-amber-300 cursor-pointer shrink-0"
+                        >
+                          <Brain className="w-4 h-4" />
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setSelectedSubject(subject.name)}
+                        aria-label={`Ouvrir ${subject.name}`}
+                        className="p-1 text-slate-500 cursor-pointer shrink-0"
+                      >
+                        <ChevronRight className="w-4 h-4" />
+                      </button>
+                    </div>
                   ))
                 )}
               </div>
@@ -497,20 +538,22 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
                       Tous les cours de {selectedSubject}
                     </p>
                     <p className="text-xs text-slate-400 font-mono tabular-nums">
-                      {currentSubjectGroup?.totalCount ?? 0} PDF
+                      {currentSubjectGroup?.totalCount ?? 0} fichiers
                     </p>
                   </div>
                   <ChevronRight className="w-4 h-4 text-amber-400 shrink-0" />
                 </button>
 
                 {currentSubjectGroup?.professors.map((prof) => (
-                  <button
+                  <div
                     key={prof.name}
-                    type="button"
-                    onClick={() => setSelectedProfessor(prof.name)}
-                    className="w-full min-h-[60px] px-4 py-3 flex items-center justify-between gap-3 active:bg-slate-800/70 transition-colors text-left cursor-pointer"
+                    className="flex items-center justify-between gap-2 px-4 py-2 min-h-[60px]"
                   >
-                    <div className="flex items-center gap-3 min-w-0">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedProfessor(prof.name)}
+                      className="flex-1 min-w-0 flex items-center gap-3 active:bg-slate-800/70 rounded-lg py-1 text-left cursor-pointer"
+                    >
                       <div className="w-9 h-9 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-center shrink-0">
                         <User className="w-4 h-4 text-slate-300" />
                       </div>
@@ -519,12 +562,38 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
                           {prof.name}
                         </p>
                         <p className="text-xs text-slate-400 font-mono tabular-nums mt-0.5">
-                          {prof.documents.length} PDF
+                          {prof.documents.length} fichiers
                         </p>
                       </div>
-                    </div>
-                    <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
-                  </button>
+                    </button>
+                    {onRequestFolderQuiz && prof.documents.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onRequestFolderQuiz({
+                            kind: 'professor',
+                            title: `${selectedSubject} / ${prof.name}`,
+                            subjectName: selectedSubject,
+                            professorName: prof.name,
+                            documents: prof.documents,
+                          });
+                        }}
+                        aria-label={`Quiz IA sur ${prof.name}`}
+                        title={`Quiz IA sur ${prof.name}`}
+                        className="min-h-[38px] min-w-[38px] rounded-lg border border-slate-800 bg-slate-900/70 flex items-center justify-center text-slate-400 active:text-amber-300 cursor-pointer shrink-0"
+                      >
+                        <Brain className="w-4 h-4" />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setSelectedProfessor(prof.name)}
+                      aria-label={`Ouvrir ${prof.name}`}
+                      className="p-1 text-slate-500 cursor-pointer shrink-0"
+                    >
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                  </div>
                 ))}
               </div>
             ) : (
@@ -898,6 +967,11 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
                   </ol>
                 )}
               </div>
+            </div>
+
+            {/* Google Gemini API Key Card (Mobile + Cloud Sync) */}
+            <div className="rounded-2xl border border-slate-800 bg-[#0F172A] p-4">
+              <GeminiApiKeySection compact />
             </div>
 
             {/* Course Title Display Format Settings (Mobile + Cloud Sync) */}

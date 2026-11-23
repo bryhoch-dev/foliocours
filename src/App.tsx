@@ -6,6 +6,7 @@ import type {
   DriveBackupPlan,
   IndexingProgress,
   ImportQueueItem,
+  QuizFolderTarget,
   SearchResult,
   SortRule,
   TitleFormatSettings,
@@ -72,6 +73,7 @@ import {SettingsAndDriveModal} from './components/SettingsAndDriveModal';
 import {DriveBackupConfirmModal} from './components/DriveBackupConfirmModal';
 import {FlattenFolderModal} from './components/FlattenFolderModal';
 import {RenameFolderModal, type RenameFolderTarget} from './components/RenameFolderModal';
+import {FolderQuizModal} from './components/FolderQuizModal';
 import {OfflineIndicator} from './components/OfflineIndicator';
 
 const CLOUD_CONFIG_MTIME_KEY = 'foliocours_cloud_config_mtime';
@@ -168,6 +170,7 @@ export default function App() {
   const [isFlattenModalOpen, setIsFlattenModalOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RenameFolderTarget | null>(null);
   const [isRenamingFolder, setIsRenamingFolder] = useState(false);
+  const [quizTarget, setQuizTarget] = useState<QuizFolderTarget | null>(null);
 
   // Google Drive Mirror Sync State
   const [driveBackupModalOpen, setDriveBackupModalOpen] = useState(false);
@@ -1272,6 +1275,7 @@ export default function App() {
           }}
           onOpenDocument={(doc) => handleOpenDocument(doc, 1, '')}
           onRequestRenameFolder={(target) => setRenameTarget(target)}
+          onRequestFolderQuiz={(target) => setQuizTarget(target)}
         />
 
         <CenterWorkspace
@@ -1328,12 +1332,17 @@ export default function App() {
 
         <PdfReaderPanel
           document={activeDoc}
+          mode={mode}
+          allDocuments={activeDocuments}
+          cloudIndex={cloudIndex}
           targetPage={readerPage}
           jumpKey={readerJumpKey}
           highlightQuery={highlightQuery}
           titleFormat={titleFormat}
           rules={rules}
           onPageChange={setReaderPage}
+          onOpenDocument={handleOpenDocument}
+          onOpenSettings={() => setIsSettingsModalOpen(true)}
           onNotify={showToast}
         />
       </div>
@@ -1362,6 +1371,7 @@ export default function App() {
         onPageChange={setReaderPage}
         onOpenDocument={handleOpenDocument}
         onCloseDocument={handleCloseDocument}
+        onRequestFolderQuiz={(target) => setQuizTarget(target)}
         onNotify={showToast}
         onConnectCloud={handleConnectOrRefreshCloud}
         onDisconnectCloud={() => {
@@ -1493,6 +1503,16 @@ export default function App() {
         isRenaming={isRenamingFolder}
         onConfirm={handleRenameFolder}
         onClose={() => setRenameTarget(null)}
+      />
+
+      <FolderQuizModal
+        target={quizTarget}
+        mode={mode}
+        cloudIndex={cloudIndex}
+        titleFormat={titleFormat}
+        rules={rules}
+        onOpenSettings={() => setIsSettingsModalOpen(true)}
+        onClose={() => setQuizTarget(null)}
       />
 
       {/* Non-intrusive toast */}

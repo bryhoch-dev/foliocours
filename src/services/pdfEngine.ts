@@ -39,14 +39,9 @@ export async function destroyPdfDocument(
   }
 }
 
-/**
- * Extracts text from a PDF page-by-page using a Uint8Array transfer to the worker
- * and aggressively releases each page and document handle to keep RAM minimal.
- */
-export async function extractPdfPagesLowRam(
-  file: File
+async function extractPagesFromPdfProxy(
+  pdf: pdfjsLib.PDFDocumentProxy
 ): Promise<{pageCount: number; pages: Array<{pageNumber: number; text: string}>}> {
-  const pdf = await loadPdfDocumentFromFile(file);
   const pages: Array<{pageNumber: number; text: string}> = [];
 
   try {
@@ -71,6 +66,24 @@ export async function extractPdfPagesLowRam(
   } finally {
     await destroyPdfDocument(pdf);
   }
+}
+
+/**
+ * Extracts text from a PDF page-by-page using a Uint8Array transfer to the worker
+ * and aggressively releases each page and document handle to keep RAM minimal.
+ */
+export async function extractPdfPagesLowRam(
+  file: File
+): Promise<{pageCount: number; pages: Array<{pageNumber: number; text: string}>}> {
+  const pdf = await loadPdfDocumentFromFile(file);
+  return extractPagesFromPdfProxy(pdf);
+}
+
+export async function extractPdfPagesFromBytesLowRam(
+  bytes: Uint8Array
+): Promise<{pageCount: number; pages: Array<{pageNumber: number; text: string}>}> {
+  const pdf = await loadPdfDocumentFromBytes(bytes);
+  return extractPagesFromPdfProxy(pdf);
 }
 
 /**

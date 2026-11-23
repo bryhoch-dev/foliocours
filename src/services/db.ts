@@ -328,6 +328,37 @@ export async function getIndexStats(): Promise<{documentCount: number; pageCount
   });
 }
 
+export async function getIndexedPagesByDocPaths(
+  docPaths: string[]
+): Promise<Map<string, Array<{pageNumber: number; text: string}>>> {
+  const result = new Map<string, Array<{pageNumber: number; text: string}>>();
+  if (docPaths.length === 0) return result;
+
+  const db = await openDatabase();
+  const uniquePaths = Array.from(new Set(docPaths));
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_PAGES, 'readonly');
+    const pageIndex = tx.objectStore(STORE_PAGES).index('by_docPath');
+
+    for (const path of uniquePaths) {
+      const req = pageIndex.getAll(IDBKeyRange.only(path));
+      req.onsuccess = () => {
+        const rows = ((req.result as StoredPageText[]) ?? [])
+          .filter((r) => !!r.text)
+          .sort((a, b) => a.pageNumber - b.pageNumber)
+          .map((r) => ({pageNumber: r.pageNumber, text: r.text}));
+        if (rows.length > 0) {
+          result.set(path, rows);
+        }
+      };
+    }
+
+    tx.oncomplete = () => resolve(result);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 /**
  * Exports all indexed documents and page text from IndexedDB via cursor
  * into a compact JSON payload suitable for uploading as `search_index.json` on Drive.

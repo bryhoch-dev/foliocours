@@ -1,0 +1,888 @@
+import React, {useEffect, useMemo, useRef, useState} from 'react';
+import {
+  AlertCircle,
+  ArrowLeft,
+  ArrowRight,
+  Brain,
+  Check,
+  CheckCircle2,
+  FileText,
+  Loader2,
+  RotateCcw,
+  Settings,
+  Sparkles,
+  X,
+  XCircle,
+} from 'lucide-react';
+import type {
+  AppMode,
+  CloudSearchIndexPayload,
+  QuizFolderTarget,
+  QuizFormatPreference,
+  QuizQuestion,
+  SortRule,
+  TitleFormatSettings,
+} from '../types/course';
+import {
+  DEFAULT_TITLE_FORMAT_SETTINGS,
+  formatCourseDisplayTitle,
+} from '../services/parser';
+import {
+  generateFolderQuiz,
+  getEffectiveGeminiApiKey,
+  isGeminiMissingKeyError,
+} from '../services/gemini';
+import {
+  collectFolderContentForQuiz,
+  type QuizContentProgress,
+} from '../services/quizContent';
+import {normaliserTexte} from '../services/db';
+import {FileFormatBadge, FileFormatIcon} from './FileFormatBadge';
+
+interface FolderQuizModalProps {
+  target: QuizFolderTarget | null;
+  mode: AppMode;
+  cloudIndex: CloudSearchIndexPayload | null;
+  titleFormat?: TitleFormatSettings;
+  rules?: SortRule[];
+  onOpenSettings: () => void;
+  onClose: () => void;
+}
+
+type QuizModalPhase = 'config' | 'loading' | 'quiz' | 'summary';
+
+interface QuestionAnswerState {
+  selectedOption?: string;
+  openInput?: string;
+  submitted: boolean;
+  isCorrect: boolean | null;
+}
+
+function areOpenAnswersCloseEnough(userAnswer: string, expected: string): boolean {
+  const u = normaliserTexte(userAnswer).replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const e = normaliserTexte(expected).replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!u || !e) return false;
+  if (u === e) return true;
+  if (u.length >= 4 && (e.includes(u) || u.includes(e))) return true;
+  return false;
+}
+
+export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
+  target,
+  mode,
+  cloudIndex,
+  titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
+  rules,
+  onOpenSettings,
+  onClose,
+}) => {
+  const [phase, setPhase] = useState<QuizModalPhase>('config');
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(() => new Set());
+  const [questionCount, setQuestionCount] = useState<5 | 10 | 15>(10);
+  const [quizFormat, setQuizFormat] = useState<QuizFormatPreference>('mixte');
+
+  const [loadingProgress, setLoadingProgress] = useState<QuizContentProgress | null>(null);
+  const [loadingStepLabel, setLoadingStepLabel] = useState('');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isMissingKeyErr, setIsMissingKeyErr] = useState(false);
+
+  const [questions, setQuestions] = useState<QuizQuestion[]>([]);
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const [answers, setAnswers] = useState<Record<number, QuestionAnswerState>>({});
+  const [openDraft, setOpenDraft] = useState('');
+
+  const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    if (!target) {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      return;
+    }
+
+    setPhase('config');
+    setSelectedPaths(new Set(target.documents.map((d) => d.relativePath)));
+    setErrorMessage(null);
+    setIsMissingKeyErr(false);
+    setLoadingProgress(null);
+    setLoadingStepLabel('');
+    setQuestions([]);
+    setCurrentIdx(0);
+    setAnswers({});
+    setOpenDraft('');
+  }, [target]);
+
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  const selectedDocs = useMemo(() => {
+    if (!target) return [];
+    return target.documents.filter((d) => selectedPaths.has(d.relativePath));
+  }, [target, selectedPaths]);
+
+  if (!target) return null;
+
+  const hasApiKey = getEffectiveGeminiApiKey().length > 0;
+  const allChecked =
+    target.documents.length > 0 && selectedPaths.size === target.documents.length;
+
+  const toggleDoc = (relativePath: string) => {
+    setSelectedPaths((prev) => {
+      const next = new Set(prev);
+      if (next.has(relativePath)) next.delete(relativePath);
+      else next.add(relativePath);
+      return next;
+    });
+  };
+
+  const toggleAllDocs = () => {
+    if (allChecked) {
+      setSelectedPaths(new Set());
+    } else {
+      setSelectedPaths(new Set(target.documents.map((d) => d.relativePath)));
+    }
+  };
+
+  const handleGenerateQuiz = async () => {
+    if (selectedDocs.length === 0) return;
+
+    if (!getEffectiveGeminiApiKey()) {
+      setIsMissingKeyErr(true);
+      setErrorMessage(
+        'Aucune clé API Google Gemini configurée. Collez votre clé dans Paramètres → Clé API Google Gemini.'
+      );
+      return;
+    }
+
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    setPhase('loading');
+    setErrorMessage(null);
+    setIsMissingKeyErr(false);
+    setLoadingProgress(null);
+    setLoadingStepLabel('Préparation des cours du dossier…');
+
+    try {
+      const contentRes = await collectFolderContentForQuiz(selectedDocs, {
+        mode,
+        cloudIndex,
+        signal: controller.signal,
+        onProgress: (p) => {
+          setLoadingProgress(p);
+          setLoadingStepLabel(
+            p.phase === 'index'
+              ? `Lecture depuis l’index (${p.current}/${p.total})`
+              : `Extraction du texte (${p.current}/${p.total})`
+          );
+        },
+      });
+
+      if (controller.signal.aborted) return;
+
+      if (contentRes.excerpts.length === 0) {
+        throw new Error(
+          'Aucun texte exploitable n’a pu être extrait des fichiers cochés (PDF scannés ou fichiers vides).'
+        );
+      }
+
+      setLoadingProgress(null);
+      setLoadingStepLabel(
+        `Génération de ${questionCount} questions avec Gemini 2.5 Flash…`
+      );
+
+      const generated = await generateFolderQuiz({
+        folderTitle: target.title,
+        questionCount,
+        format: quizFormat,
+        excerpts: contentRes.excerpts,
+        signal: controller.signal,
+      });
+
+      if (controller.signal.aborted) return;
+
+      setQuestions(generated);
+      setCurrentIdx(0);
+      setAnswers({});
+      setOpenDraft('');
+      setPhase('quiz');
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setPhase('config');
+        return;
+      }
+      setIsMissingKeyErr(isGeminiMissingKeyError(err));
+      setErrorMessage(
+        err instanceof Error
+          ? err.message
+          : 'Impossible de générer le quiz pour ce dossier.'
+      );
+      setPhase('config');
+    }
+  };
+
+  const handleSelectQcmOption = (qIndex: number, option: string) => {
+    const q = questions[qIndex];
+    if (!q || answers[qIndex]?.submitted) return;
+    const isCorrect =
+      normaliserTexte(option).trim() === normaliserTexte(q.reponseCorrecte).trim();
+    setAnswers((prev) => ({
+      ...prev,
+      [qIndex]: {
+        selectedOption: option,
+        submitted: true,
+        isCorrect,
+      },
+    }));
+  };
+
+  const handleSubmitOpenAnswer = (qIndex: number) => {
+    const q = questions[qIndex];
+    if (!q) return;
+    const trimmed = openDraft.trim();
+    const autoCorrect = trimmed
+      ? areOpenAnswersCloseEnough(trimmed, q.reponseCorrecte)
+      : false;
+    setAnswers((prev) => ({
+      ...prev,
+      [qIndex]: {
+        openInput: trimmed,
+        submitted: true,
+        isCorrect: autoCorrect,
+      },
+    }));
+  };
+
+  const handleOverrideCorrectness = (qIndex: number, isCorrect: boolean) => {
+    setAnswers((prev) => ({
+      ...prev,
+      [qIndex]: {
+        ...(prev[qIndex] ?? {submitted: true}),
+        submitted: true,
+        isCorrect,
+      },
+    }));
+  };
+
+  const goToQuestion = (nextIdx: number) => {
+    if (nextIdx < 0 || nextIdx >= questions.length) return;
+    setCurrentIdx(nextIdx);
+    setOpenDraft(answers[nextIdx]?.openInput ?? '');
+  };
+
+  const currentQuestion = questions[currentIdx];
+  const currentAnswer = answers[currentIdx];
+
+  const answeredCount = Object.values(answers).filter((a) => a.submitted).length;
+  const correctCount = Object.values(answers).filter((a) => a.isCorrect === true).length;
+  const missedQuestions = questions.filter((_, idx) => answers[idx]?.isCorrect !== true);
+
+  const handleReplayMissed = () => {
+    if (missedQuestions.length === 0) return;
+    setQuestions(missedQuestions);
+    setAnswers({});
+    setCurrentIdx(0);
+    setOpenDraft('');
+    setPhase('quiz');
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-3 sm:p-4 backdrop-blur-xs"
+      onClick={() => {
+        if (phase !== 'loading') onClose();
+      }}
+    >
+      <div
+        className="w-full max-w-2xl rounded-xl border border-slate-800 bg-[#0F172A] shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Modal Header */}
+        <div className="px-4 sm:px-5 py-3.5 border-b border-slate-800 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center shrink-0">
+              <Brain className="w-4 h-4 text-amber-400" />
+            </div>
+            <div className="min-w-0">
+              <h2 className="font-display text-sm sm:text-base font-semibold text-slate-100 truncate">
+                Quiz IA — {target.title}
+              </h2>
+              <p className="text-[11px] text-slate-400 truncate">
+                {phase === 'config'
+                  ? `${selectedDocs.length}/${target.documents.length} fichier${
+                      target.documents.length > 1 ? 's' : ''
+                    } sélectionné${selectedDocs.length > 1 ? 's' : ''}`
+                  : phase === 'loading'
+                  ? 'Préparation du test de connaissances…'
+                  : phase === 'quiz'
+                  ? `Question ${currentIdx + 1} sur ${questions.length} · ${correctCount} juste${
+                      correctCount > 1 ? 's' : ''
+                    }`
+                  : `Bilan final : ${correctCount} / ${questions.length}`}
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              abortRef.current?.abort();
+              onClose();
+            }}
+            aria-label="Fermer"
+            className="rounded-md p-1.5 text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* Modal Body */}
+        <div className="flex-1 overflow-y-auto p-4 sm:p-5">
+          {phase === 'config' && (
+            <div className="space-y-5">
+              {(!hasApiKey || errorMessage) && (
+                <div
+                  className={`rounded-lg border p-3.5 text-xs space-y-2 ${
+                    errorMessage
+                      ? 'border-rose-500/40 bg-rose-500/10 text-rose-200'
+                      : 'border-amber-500/35 bg-amber-500/10 text-amber-200'
+                  }`}
+                >
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                    <p className="leading-relaxed">
+                      {errorMessage ||
+                        'Aucune clé API Google Gemini configurée. Renseignez votre clé dans Paramètres pour générer un quiz.'}
+                    </p>
+                  </div>
+                  {(isMissingKeyErr || !hasApiKey) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onClose();
+                        onOpenSettings();
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-amber-500 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-amber-400 cursor-pointer"
+                    >
+                      <Settings className="w-3.5 h-3.5" />
+                      <span>Ouvrir les Paramètres</span>
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* File selection checklist */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-xs font-semibold text-slate-200">
+                    Fichiers inclus dans le quiz ({selectedDocs.length}/{target.documents.length})
+                  </label>
+                  <button
+                    type="button"
+                    onClick={toggleAllDocs}
+                    className="text-xs text-amber-300 hover:text-amber-200 cursor-pointer"
+                  >
+                    {allChecked ? 'Tout décocher' : 'Tout cocher'}
+                  </button>
+                </div>
+
+                <div className="max-h-52 overflow-y-auto rounded-lg border border-slate-800 bg-[#0B1120] divide-y divide-slate-800/70">
+                  {target.documents.map((doc) => {
+                    const checked = selectedPaths.has(doc.relativePath);
+                    const displayTitle = formatCourseDisplayTitle(doc.name, titleFormat, {
+                      subject: doc.subject,
+                      professor: doc.professor,
+                      rules,
+                    });
+                    return (
+                      <label
+                        key={doc.relativePath}
+                        className="flex items-center gap-2.5 px-3 py-2 text-xs cursor-pointer hover:bg-slate-800/40"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleDoc(doc.relativePath)}
+                          className="accent-amber-500 rounded cursor-pointer shrink-0"
+                        />
+                        <FileFormatIcon
+                          fileName={doc.name}
+                          format={doc.format}
+                          className="w-3.5 h-3.5 shrink-0"
+                        />
+                        <span className="flex-1 min-w-0 truncate text-slate-200" title={doc.name}>
+                          {displayTitle}
+                        </span>
+                        <span className="text-[11px] text-slate-500 truncate max-w-[120px] hidden sm:inline">
+                          {doc.professor}
+                        </span>
+                        <FileFormatBadge fileName={doc.name} format={doc.format} />
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Count + Format */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="block text-xs font-semibold text-slate-200">
+                    Nombre de questions
+                  </label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {([5, 10, 15] as const).map((count) => (
+                      <button
+                        key={count}
+                        type="button"
+                        onClick={() => setQuestionCount(count)}
+                        className={`rounded-lg border py-2 text-xs font-semibold transition-colors cursor-pointer ${
+                          questionCount === count
+                            ? 'border-amber-500 bg-amber-500/15 text-amber-300'
+                            : 'border-slate-800 bg-[#0B1120] text-slate-300 hover:border-slate-700'
+                        }`}
+                      >
+                        {count}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="block text-xs font-semibold text-slate-200">
+                    Format des questions
+                  </label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {(
+                      [
+                        {id: 'qcm', label: 'QCM'},
+                        {id: 'ouverte', label: 'Courtes'},
+                        {id: 'mixte', label: 'Mixte'},
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setQuizFormat(opt.id)}
+                        className={`rounded-lg border py-2 text-xs font-semibold transition-colors cursor-pointer ${
+                          quizFormat === opt.id
+                            ? 'border-amber-500 bg-amber-500/15 text-amber-300'
+                            : 'border-slate-800 bg-[#0B1120] text-slate-300 hover:border-slate-700'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {phase === 'loading' && (
+            <div className="py-12 px-4 flex flex-col items-center text-center space-y-4">
+              <div className="w-12 h-12 rounded-2xl border border-amber-500/30 bg-amber-500/10 flex items-center justify-center">
+                <Loader2 className="w-6 h-6 text-amber-400 animate-spin" />
+              </div>
+              <div className="space-y-1 max-w-md">
+                <p className="text-sm font-medium text-slate-100">
+                  {loadingStepLabel || 'Génération du quiz en cours…'}
+                </p>
+                {loadingProgress && (
+                  <p className="text-xs text-slate-400 truncate">
+                    {loadingProgress.fileName}
+                  </p>
+                )}
+              </div>
+              {loadingProgress && loadingProgress.total > 0 && (
+                <div className="w-full max-w-xs h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                  <div
+                    className="h-full bg-amber-500 transition-all duration-150"
+                    style={{
+                      width: `${Math.round(
+                        (loadingProgress.current / loadingProgress.total) * 100
+                      )}%`,
+                    }}
+                  />
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={() => abortRef.current?.abort()}
+                className="rounded-lg border border-slate-700 px-3.5 py-1.5 text-xs text-slate-300 hover:bg-slate-800 cursor-pointer"
+              >
+                Annuler
+              </button>
+            </div>
+          )}
+
+          {phase === 'quiz' && currentQuestion && (
+            <div className="space-y-5">
+              {/* Stepper Pills */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                {questions.map((_, idx) => {
+                  const ans = answers[idx];
+                  const isCurrent = idx === currentIdx;
+                  let style =
+                    'border-slate-800 bg-[#0B1120] text-slate-400 hover:border-slate-700';
+                  if (ans?.submitted) {
+                    style = ans.isCorrect
+                      ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
+                      : 'border-rose-500/50 bg-rose-500/15 text-rose-300';
+                  }
+                  if (isCurrent) {
+                    style += ' ring-2 ring-amber-400/70';
+                  }
+                  return (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => goToQuestion(idx)}
+                      className={`w-7 h-7 rounded-md border font-mono tabular-nums text-xs font-medium cursor-pointer transition-all ${style}`}
+                    >
+                      {idx + 1}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Question Card */}
+              <div className="rounded-xl border border-slate-800 bg-[#0B1120] p-4 space-y-4">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wider text-amber-300">
+                    <Sparkles className="w-3 h-3" />
+                    <span>
+                      {currentQuestion.type === 'qcm'
+                        ? 'Choix multiple (QCM)'
+                        : 'Question courte'}
+                    </span>
+                  </span>
+                  <span className="inline-flex items-center gap-1 text-[11px] text-slate-400 truncate max-w-[260px]">
+                    <FileText className="w-3 h-3 shrink-0" />
+                    <span className="truncate" title={currentQuestion.fichierSource}>
+                      {currentQuestion.fichierSource}
+                    </span>
+                  </span>
+                </div>
+
+                <p className="text-sm sm:text-[15px] font-medium text-slate-100 leading-relaxed">
+                  {currentQuestion.question}
+                </p>
+
+                {currentQuestion.type === 'qcm' ? (
+                  <div className="space-y-2">
+                    {currentQuestion.options.map((opt, optIdx) => {
+                      const letter = String.fromCharCode(65 + optIdx);
+                      const isSubmitted = !!currentAnswer?.submitted;
+                      const isSelected = currentAnswer?.selectedOption === opt;
+                      const isTargetCorrect =
+                        normaliserTexte(opt).trim() ===
+                        normaliserTexte(currentQuestion.reponseCorrecte).trim();
+
+                      let btnStyle =
+                        'border-slate-800 bg-[#0F172A] text-slate-200 hover:border-amber-500/50 hover:bg-slate-800/70';
+                      if (isSubmitted) {
+                        if (isTargetCorrect) {
+                          btnStyle =
+                            'border-emerald-500/70 bg-emerald-500/15 text-emerald-200';
+                        } else if (isSelected) {
+                          btnStyle = 'border-rose-500/70 bg-rose-500/15 text-rose-200';
+                        } else {
+                          btnStyle = 'border-slate-800/70 bg-[#0F172A]/60 text-slate-500';
+                        }
+                      }
+
+                      return (
+                        <button
+                          key={optIdx}
+                          type="button"
+                          disabled={isSubmitted}
+                          onClick={() => handleSelectQcmOption(currentIdx, opt)}
+                          className={`w-full rounded-lg border px-3.5 py-2.5 text-left text-xs sm:text-sm flex items-start gap-3 transition-colors ${
+                            isSubmitted ? 'cursor-default' : 'cursor-pointer'
+                          } ${btnStyle}`}
+                        >
+                          <span className="font-mono text-xs font-semibold px-1.5 py-0.5 rounded bg-slate-800/90 text-slate-300 shrink-0 mt-0.5">
+                            {letter}
+                          </span>
+                          <span className="flex-1 leading-relaxed">{opt}</span>
+                          {isSubmitted && isTargetCorrect && (
+                            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                          )}
+                          {isSubmitted && isSelected && !isTargetCorrect && (
+                            <XCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <textarea
+                      rows={3}
+                      disabled={!!currentAnswer?.submitted}
+                      value={currentAnswer?.submitted ? currentAnswer.openInput ?? '' : openDraft}
+                      onChange={(e) => setOpenDraft(e.target.value)}
+                      placeholder="Rédigez votre réponse courte ici…"
+                      className="w-full rounded-lg border border-slate-800 bg-[#0F172A] p-3 text-xs sm:text-sm text-slate-100 placeholder:text-slate-500 focus:border-amber-500/60 focus:outline-none disabled:opacity-75"
+                    />
+                    {!currentAnswer?.submitted && (
+                      <button
+                        type="button"
+                        onClick={() => handleSubmitOpenAnswer(currentIdx)}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3.5 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 cursor-pointer"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                        <span>Vérifier la réponse</span>
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {/* Immediate Correction & Explanation */}
+                {currentAnswer?.submitted && (
+                  <div
+                    className={`rounded-lg border p-3.5 space-y-2.5 text-xs ${
+                      currentAnswer.isCorrect
+                        ? 'border-emerald-500/40 bg-emerald-500/10'
+                        : 'border-amber-500/35 bg-amber-500/10'
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span
+                        className={`inline-flex items-center gap-1.5 font-semibold ${
+                          currentAnswer.isCorrect ? 'text-emerald-300' : 'text-amber-300'
+                        }`}
+                      >
+                        {currentAnswer.isCorrect ? (
+                          <>
+                            <CheckCircle2 className="w-4 h-4" />
+                            <span>Bonne réponse</span>
+                          </>
+                        ) : (
+                          <>
+                            <XCircle className="w-4 h-4 text-rose-400" />
+                            <span className="text-rose-300">À revoir</span>
+                          </>
+                        )}
+                      </span>
+
+                      {currentQuestion.type === 'ouverte' && (
+                        <div className="inline-flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => handleOverrideCorrectness(currentIdx, true)}
+                            className={`rounded px-2 py-1 text-[11px] font-medium cursor-pointer border ${
+                              currentAnswer.isCorrect
+                                ? 'border-emerald-500/60 bg-emerald-500/20 text-emerald-200'
+                                : 'border-slate-700 bg-slate-800 text-slate-300 hover:text-emerald-300'
+                            }`}
+                          >
+                            J’avais juste
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleOverrideCorrectness(currentIdx, false)}
+                            className={`rounded px-2 py-1 text-[11px] font-medium cursor-pointer border ${
+                              currentAnswer.isCorrect === false
+                                ? 'border-rose-500/60 bg-rose-500/20 text-rose-200'
+                                : 'border-slate-700 bg-slate-800 text-slate-300 hover:text-rose-300'
+                            }`}
+                          >
+                            À revoir
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {currentQuestion.type === 'ouverte' && (
+                      <div className="rounded-md bg-[#0B1120]/80 border border-slate-800 p-2.5 text-slate-200">
+                        <span className="text-[11px] uppercase tracking-wide text-slate-400 block mb-0.5">
+                          Réponse attendue
+                        </span>
+                        <p className="leading-relaxed font-medium">
+                          {currentQuestion.reponseCorrecte}
+                        </p>
+                      </div>
+                    )}
+
+                    <p className="text-slate-200 leading-relaxed">
+                      {currentQuestion.explication}
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {phase === 'summary' && (
+            <div className="space-y-5">
+              <div className="rounded-xl border border-slate-800 bg-[#0B1120] p-5 text-center space-y-2">
+                <p className="text-xs uppercase tracking-wider text-slate-400">
+                  Score final
+                </p>
+                <p className="font-display text-3xl font-bold text-amber-400 tabular-nums">
+                  {correctCount} / {questions.length}
+                </p>
+                <p className="text-xs text-slate-300">
+                  {Math.round((correctCount / Math.max(1, questions.length)) * 100)}% de réussite
+                  {missedQuestions.length === 0
+                    ? ' — Maîtrise parfaite sur cette série !'
+                    : ` · ${missedQuestions.length} question${
+                        missedQuestions.length > 1 ? 's' : ''
+                      } à revoir`}
+                </p>
+              </div>
+
+              <div className="space-y-2.5">
+                {questions.map((q, idx) => {
+                  const ans = answers[idx];
+                  const ok = ans?.isCorrect === true;
+                  return (
+                    <div
+                      key={idx}
+                      className={`rounded-lg border p-3.5 text-xs space-y-1.5 ${
+                        ok
+                          ? 'border-emerald-500/30 bg-emerald-500/5'
+                          : 'border-rose-500/30 bg-rose-500/5'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <p className="font-medium text-slate-100 leading-snug">
+                          {idx + 1}. {q.question}
+                        </p>
+                        {ok ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                        ) : (
+                          <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                        )}
+                      </div>
+                      <p className="text-emerald-300">
+                        Réponse : <span className="font-medium">{q.reponseCorrecte}</span>
+                      </p>
+                      <p className="text-slate-300 leading-relaxed">{q.explication}</p>
+                      <p className="text-[11px] text-slate-500">
+                        Source : {q.fichierSource}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Modal Footer */}
+        <div className="px-4 sm:px-5 py-3.5 border-t border-slate-800 bg-[#0B1120] flex flex-wrap items-center justify-between gap-2.5">
+          {phase === 'config' && (
+            <>
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-lg border border-slate-700 px-3.5 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 cursor-pointer"
+              >
+                Fermer
+              </button>
+              <button
+                type="button"
+                disabled={selectedDocs.length === 0}
+                onClick={() => void handleGenerateQuiz()}
+                className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:opacity-45 cursor-pointer"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Générer le quiz</span>
+              </button>
+            </>
+          )}
+
+          {phase === 'loading' && (
+            <div className="w-full flex justify-end">
+              <button
+                type="button"
+                onClick={() => abortRef.current?.abort()}
+                className="rounded-lg border border-slate-700 px-3.5 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 cursor-pointer"
+              >
+                Annuler
+              </button>
+            </div>
+          )}
+
+          {phase === 'quiz' && (
+            <>
+              <button
+                type="button"
+                disabled={currentIdx === 0}
+                onClick={() => goToQuestion(currentIdx - 1)}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-40 cursor-pointer"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                <span>Précédente</span>
+              </button>
+
+              <span className="text-[11px] font-mono tabular-nums text-slate-400">
+                {answeredCount}/{questions.length} répondues
+              </span>
+
+              {currentIdx < questions.length - 1 ? (
+                <button
+                  type="button"
+                  onClick={() => goToQuestion(currentIdx + 1)}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3.5 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 cursor-pointer"
+                >
+                  <span>Suivante</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setPhase('summary')}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3.5 py-2 text-xs font-semibold text-slate-950 hover:bg-emerald-400 cursor-pointer"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>Voir le bilan</span>
+                </button>
+              )}
+            </>
+          )}
+
+          {phase === 'summary' && (
+            <>
+              <button
+                type="button"
+                onClick={() => setPhase('config')}
+                className="rounded-lg border border-slate-700 px-3.5 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 cursor-pointer"
+              >
+                Nouveau quiz
+              </button>
+
+              <div className="flex items-center gap-2">
+                {missedQuestions.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleReplayMissed}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3.5 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 cursor-pointer"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>
+                      Rejouer les questions ratées ({missedQuestions.length})
+                    </span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="rounded-lg bg-slate-800 px-3.5 py-2 text-xs font-medium text-slate-200 hover:bg-slate-700 cursor-pointer"
+                >
+                  Fermer
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};

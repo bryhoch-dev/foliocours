@@ -161,3 +161,28 @@ export interface IndexingProgress {
 
 export type WorkspaceTab = 'library' | 'import' | 'search';
 export type MobileTab = 'courses' | 'search' | 'sync';
+
+export type QuizFormatPreference = 'qcm' | 'ouverte' | 'mixte';
+export type QuizQuestionType = 'qcm' | 'ouverte';
+
+export interface QuizQuestion {
+  question: string;
+  type: QuizQuestionType;
+  options: string[];
+  reponseCorrecte: string;
+  explication: string;
+  fichierSource: string;
+}
+
+export interface QuizFolderTarget {
+  kind: 'subject' | 'professor';
+  title: string;
+  subjectName: string;
+  professorName?: string;
+  documents: CourseDocument[];
+}
+
+export interface GeminiChatTurn {
+  role: 'user' | 'model';
+  text: string;
+}
