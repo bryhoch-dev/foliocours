@@ -31,6 +31,8 @@ interface ReaderAssistantDrawerProps {
   // Explain (AI)
   chatHistory: GeminiChatTurn[];
   isExplaining: boolean;
+  explainStatus?: string | null;
+  modelUsed?: string | null;
   explainError: string | null;
   isMissingApiKey: boolean;
   onAskFollowUp: (question: string) => void;
@@ -179,6 +181,8 @@ export const ReaderAssistantDrawer: React.FC<ReaderAssistantDrawerProps> = ({
   selectedText,
   chatHistory,
   isExplaining,
+  explainStatus,
+  modelUsed,
   explainError,
   isMissingApiKey,
   onAskFollowUp,
@@ -301,10 +305,23 @@ export const ReaderAssistantDrawer: React.FC<ReaderAssistantDrawerProps> = ({
             })}
 
             {isExplaining && (
-              <div className="rounded-lg border border-slate-800 bg-[#0B1120] p-3 flex items-center gap-2 text-xs text-slate-300">
-                <Loader2 className="w-4 h-4 text-amber-400 animate-spin shrink-0" />
-                <span>Gemini analyse ce passage…</span>
+              <div className="rounded-lg border border-slate-800 bg-[#0B1120] p-3 space-y-1.5 text-xs text-slate-300">
+                <div className="flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 text-amber-400 animate-spin shrink-0" />
+                  <span>Gemini analyse ce passage…</span>
+                </div>
+                {explainStatus && (
+                  <p className="text-[11px] text-amber-300/90 pl-6 leading-snug">
+                    {explainStatus}
+                  </p>
+                )}
               </div>
+            )}
+
+            {modelUsed && !isExplaining && chatHistory.some((t) => t.role === 'model') && (
+              <p className="text-[11px] font-mono text-slate-500 text-right">
+                Répondu via {modelUsed}
+              </p>
             )}
 
             {explainError && (

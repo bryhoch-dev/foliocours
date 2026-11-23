@@ -5,8 +5,22 @@ import type {
 } from '../types/course';
 
 const GEMINI_API_KEY_STORAGE_KEY = 'foliocours_gemini_api_key';
-const GEMINI_MODEL = 'gemini-3.8-flash';
-const GEMINI_GENERATE_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const GEMINI_MODEL_STORAGE_KEY = 'foliocours_gemini_model';
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
+
+const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+const STATIC_FALLBACK_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-3.8-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-2.0-flash',
+  'gemini-2.5-pro',
+];
+
+const MODEL_DISCOVERY_TTL_MS = 5 * 60 * 1000;
+let cachedModelsEntry: {apiKey: string; fetchedAt: number; models: string[]} | null =
+  null;
 
 export class GeminiMissingKeyError extends Error {
   constructor() {
@@ -17,8 +31,22 @@ export class GeminiMissingKeyError extends Error {
   }
 }
 
+export class GeminiAllModelsUnavailableError extends Error {
+  constructor(detail?: string) {
+    super(
+      detail ||
+        'Tous les modèles Gemini disponibles sont actuellement saturés ou inaccessibles.'
+    );
+    this.name = 'GeminiAllModelsUnavailableError';
+  }
+}
+
 export function isGeminiMissingKeyError(err: unknown): boolean {
   return err instanceof GeminiMissingKeyError;
+}
+
+export function isGeminiAllModelsUnavailableError(err: unknown): boolean {
+  return err instanceof GeminiAllModelsUnavailableError;
 }
 
 export function getSavedGeminiApiKey(): string {
@@ -42,6 +70,31 @@ export function saveGeminiApiKey(apiKey: string): void {
   } catch {
     // ignore storage errors
   }
+  cachedModelsEntry = null;
+}
+
+export function getSavedGeminiModel(): string {
+  if (typeof window === 'undefined') return DEFAULT_GEMINI_MODEL;
+  try {
+    const saved = localStorage.getItem(GEMINI_MODEL_STORAGE_KEY)?.trim();
+    return saved ? normalizeModelName(saved) : DEFAULT_GEMINI_MODEL;
+  } catch {
+    return DEFAULT_GEMINI_MODEL;
+  }
+}
+
+export function saveGeminiModel(model: string): void {
+  if (typeof window === 'undefined') return;
+  const cleaned = normalizeModelName(model.trim());
+  try {
+    if (cleaned && cleaned !== DEFAULT_GEMINI_MODEL) {
+      localStorage.setItem(GEMINI_MODEL_STORAGE_KEY, cleaned);
+    } else {
+      localStorage.removeItem(GEMINI_MODEL_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
 }
 
 export function hasEnvFallbackGeminiKey(): boolean {
@@ -54,6 +107,92 @@ export function getEffectiveGeminiApiKey(): string {
   if (saved) return saved;
   const envKey = import.meta.env.VITE_GEMINI_API_KEY;
   return typeof envKey === 'string' ? envKey.trim() : '';
+}
+
+function normalizeModelName(raw: string): string {
+  return raw.replace(/^models\//i, '').trim();
+}
+
+interface GeminiListedModel {
+  name?: string;
+  supportedGenerationMethods?: string[];
+}
+
+interface GeminiModelsListResponse {
+  models?: GeminiListedModel[];
+}
+
+function isEligibleTextGeminiModel(rawName: string, methods?: string[]): boolean {
+  if (methods && !methods.includes('generateContent')) return false;
+  const name = normalizeModelName(rawName).toLowerCase();
+  if (!name.includes('gemini')) return false;
+  if (!name.includes('flash') && !name.includes('pro')) return false;
+  if (/(vision|embedding|image|tts)/i.test(name)) return false;
+  return true;
+}
+
+function scoreDiscoveredModel(modelName: string): number {
+  const lower = modelName.toLowerCase();
+  let score = 0;
+  if (lower.includes('flash')) score += 100;
+  else if (lower.includes('pro')) score += 50;
+
+  if (lower.includes('lite')) score += 5;
+  if (lower.includes('latest')) score += 4;
+  if (lower.includes('3.8')) score += 40;
+  else if (lower.includes('3.')) score += 35;
+  else if (lower.includes('2.5')) score += 30;
+  else if (lower.includes('2.0')) score += 20;
+  else if (lower.includes('1.5')) score += 10;
+
+  if (lower.includes('exp') || lower.includes('preview')) score -= 3;
+  return score;
+}
+
+async function discoverCompatibleModels(
+  apiKey: string,
+  signal?: AbortSignal
+): Promise<string[]> {
+  if (
+    cachedModelsEntry &&
+    cachedModelsEntry.apiKey === apiKey &&
+    Date.now() - cachedModelsEntry.fetchedAt < MODEL_DISCOVERY_TTL_MS
+  ) {
+    return cachedModelsEntry.models;
+  }
+
+  try {
+    const res = await fetch(
+      `${GEMINI_API_BASE}/models?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'GET',
+        signal,
+      }
+    );
+    if (!res.ok) {
+      return [];
+    }
+    const json = (await res.json()) as GeminiModelsListResponse;
+    const eligible = (json.models ?? [])
+      .filter(
+        (m) =>
+          typeof m.name === 'string' &&
+          isEligibleTextGeminiModel(m.name, m.supportedGenerationMethods)
+      )
+      .map((m) => normalizeModelName(m.name!))
+      .sort((a, b) => scoreDiscoveredModel(b) - scoreDiscoveredModel(a));
+
+    const unique = Array.from(new Set(eligible));
+    cachedModelsEntry = {
+      apiKey,
+      fetchedAt: Date.now(),
+      models: unique,
+    };
+    return unique;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw err;
+    return [];
+  }
 }
 
 interface GeminiCandidatePart {
@@ -74,59 +213,191 @@ interface GeminiGenerateResponse {
   };
 }
 
-async function callGeminiGenerateContent(
-  payload: Record<string, unknown>,
-  signal?: AbortSignal
-): Promise<string> {
+function isRetryableModelFailure(status: number, message: string): boolean {
+  if (status === 429 || status === 500 || status === 503 || status === 404) {
+    return true;
+  }
+  return /(high demand|overloaded|quota|no longer available|not found|resource exhausted|rate limit|unavailable)/i.test(
+    message
+  );
+}
+
+function isInvalidApiKeyFailure(status: number, message: string): boolean {
+  if (status === 401) return true;
+  if (
+    (status === 400 || status === 403) &&
+    /api key|api_key_invalid|expired|invalid.*key|permission_denied/i.test(message)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export interface GeminiCallOptions {
+  contents?: Array<{role: 'user' | 'model'; parts: Array<{text: string}>}>;
+  systemInstruction?: {parts: Array<{text: string}>};
+  generationConfig?: Record<string, unknown>;
+  preferredModel?: string;
+  signal?: AbortSignal;
+  onStatus?: (message: string) => void;
+}
+
+export interface GeminiCallResult {
+  text: string;
+  modelUsed: string;
+}
+
+/**
+ * Centralized Gemini caller with dynamic compatible-model discovery
+ * and automatic fallback on saturation / unavailability (429, 500, 503, 404, etc.).
+ */
+export async function appelerGeminiAvecSecours(
+  prompt: string,
+  options: GeminiCallOptions = {}
+): Promise<GeminiCallResult> {
   const apiKey = getEffectiveGeminiApiKey();
   if (!apiKey) {
     throw new GeminiMissingKeyError();
   }
 
-  const response = await fetch(
-    `${GEMINI_GENERATE_URL}?key=${encodeURIComponent(apiKey)}`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-      signal,
-    }
+  const preferred = normalizeModelName(
+    options.preferredModel?.trim() || getSavedGeminiModel()
   );
 
-  let data: GeminiGenerateResponse | null = null;
-  try {
-    data = (await response.json()) as GeminiGenerateResponse;
-  } catch {
-    // non-JSON response
+  const discovered = await discoverCompatibleModels(apiKey, options.signal);
+  const candidateModels = Array.from(
+    new Set([
+      ...(preferred ? [preferred] : []),
+      ...discovered,
+      ...STATIC_FALLBACK_MODELS,
+    ])
+  ).filter((name) => isEligibleTextGeminiModel(name) || name === preferred);
+
+  const payload: Record<string, unknown> = {
+    contents: options.contents ?? [
+      {
+        role: 'user',
+        parts: [{text: prompt}],
+      },
+    ],
+  };
+
+  if (options.systemInstruction) {
+    payload.systemInstruction = options.systemInstruction;
+  }
+  if (options.generationConfig) {
+    payload.generationConfig = options.generationConfig;
   }
 
-  if (!response.ok) {
-    const apiMessage = data?.error?.message?.trim();
-    if (response.status === 400 || response.status === 401 || response.status === 403) {
-      if (apiMessage && /api key|expired|invalid|permission/i.test(apiMessage)) {
-        throw new Error(
-          `Clé API Gemini invalide ou refusée (${apiMessage}). Vérifiez votre clé dans Paramètres.`
+  let lastErrorMessage = '';
+
+  for (let i = 0; i < candidateModels.length; i++) {
+    if (options.signal?.aborted) {
+      throw new DOMException('Requête annulée.', 'AbortError');
+    }
+
+    const model = candidateModels[i];
+
+    try {
+      const response = await fetch(
+        `${GEMINI_API_BASE}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+          signal: options.signal,
+        }
+      );
+
+      let data: GeminiGenerateResponse | null = null;
+      try {
+        data = (await response.json()) as GeminiGenerateResponse;
+      } catch {
+        // non-JSON response
+      }
+
+      if (!response.ok) {
+        const apiMessage = data?.error?.message?.trim() || `HTTP ${response.status}`;
+
+        if (isInvalidApiKeyFailure(response.status, apiMessage)) {
+          throw new Error(
+            `Clé API Gemini invalide ou refusée (${apiMessage}). Vérifiez votre clé dans Paramètres.`
+          );
+        }
+
+        if (isRetryableModelFailure(response.status, apiMessage)) {
+          lastErrorMessage = `${model} : ${apiMessage}`;
+          if (i < candidateModels.length - 1) {
+            options.onStatus?.(
+              'Modèle saturé, bascule automatique sur un modèle disponible...'
+            );
+          }
+          continue;
+        }
+
+        throw new Error(apiMessage || `Erreur API Gemini (HTTP ${response.status}).`);
+      }
+
+      const parts = data?.candidates?.[0]?.content?.parts ?? [];
+      const text = parts
+        .map((part) => (typeof part.text === 'string' ? part.text : ''))
+        .join('')
+        .trim();
+
+      if (!text) {
+        lastErrorMessage = `${model} : réponse vide`;
+        if (i < candidateModels.length - 1) {
+          options.onStatus?.(
+            'Modèle saturé, bascule automatique sur un modèle disponible...'
+          );
+          continue;
+        }
+        throw new GeminiAllModelsUnavailableError(
+          'Gemini n’a renvoyé aucune réponse exploitable.'
         );
       }
+
+      return {text, modelUsed: model};
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+      if (
+        err instanceof Error &&
+        err.message.includes('Clé API Gemini invalide')
+      ) {
+        throw err;
+      }
+
+      if (err instanceof TypeError) {
+        // Network offline or fetch failure
+        throw new GeminiAllModelsUnavailableError(
+          'Connexion réseau indisponible pour contacter les serveurs Google Gemini.'
+        );
+      }
+
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isRetryableModelFailure(0, msg)) {
+        lastErrorMessage = msg;
+        if (i < candidateModels.length - 1) {
+          options.onStatus?.(
+            'Modèle saturé, bascule automatique sur un modèle disponible...'
+          );
+        }
+        continue;
+      }
+
+      throw err;
     }
-    throw new Error(
-      apiMessage || `Erreur API Gemini (HTTP ${response.status}).`
-    );
   }
 
-  const parts = data?.candidates?.[0]?.content?.parts ?? [];
-  const text = parts
-    .map((part) => (typeof part.text === 'string' ? part.text : ''))
-    .join('')
-    .trim();
-
-  if (!text) {
-    throw new Error('Gemini n’a renvoyé aucune réponse exploitable.');
-  }
-
-  return text;
+  throw new GeminiAllModelsUnavailableError(
+    lastErrorMessage
+      ? `Tous les modèles Gemini sont actuellement saturés ou indisponibles (${lastErrorMessage}).`
+      : undefined
+  );
 }
 
 export interface QuizCourseExcerpt {
@@ -140,8 +411,9 @@ export async function generateFolderQuiz(params: {
   format: QuizFormatPreference;
   excerpts: QuizCourseExcerpt[];
   signal?: AbortSignal;
-}): Promise<QuizQuestion[]> {
-  const {folderTitle, questionCount, format, excerpts, signal} = params;
+  onStatus?: (message: string) => void;
+}): Promise<{questions: QuizQuestion[]; modelUsed: string}> {
+  const {folderTitle, questionCount, format, excerpts, signal, onStatus} = params;
   if (excerpts.length === 0) {
     throw new Error('Aucun contenu textuel exploitable dans les fichiers sélectionnés.');
   }
@@ -176,52 +448,45 @@ export async function generateFolderQuiz(params: {
     contextBlock,
   ].join('\n');
 
-  const rawJson = await callGeminiGenerateContent(
-    {
-      contents: [
-        {
-          role: 'user',
-          parts: [{text: prompt}],
-        },
-      ],
-      generationConfig: {
-        temperature: 0.35,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: 'OBJECT',
-          properties: {
-            questions: {
-              type: 'ARRAY',
-              items: {
-                type: 'OBJECT',
-                properties: {
-                  question: {type: 'STRING'},
-                  type: {type: 'STRING', enum: ['qcm', 'ouverte']},
-                  options: {
-                    type: 'ARRAY',
-                    items: {type: 'STRING'},
-                  },
-                  reponseCorrecte: {type: 'STRING'},
-                  explication: {type: 'STRING'},
-                  fichierSource: {type: 'STRING'},
+  const {text: rawJson, modelUsed} = await appelerGeminiAvecSecours(prompt, {
+    signal,
+    onStatus,
+    generationConfig: {
+      temperature: 0.35,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          questions: {
+            type: 'ARRAY',
+            items: {
+              type: 'OBJECT',
+              properties: {
+                question: {type: 'STRING'},
+                type: {type: 'STRING', enum: ['qcm', 'ouverte']},
+                options: {
+                  type: 'ARRAY',
+                  items: {type: 'STRING'},
                 },
-                required: [
-                  'question',
-                  'type',
-                  'options',
-                  'reponseCorrecte',
-                  'explication',
-                  'fichierSource',
-                ],
+                reponseCorrecte: {type: 'STRING'},
+                explication: {type: 'STRING'},
+                fichierSource: {type: 'STRING'},
               },
+              required: [
+                'question',
+                'type',
+                'options',
+                'reponseCorrecte',
+                'explication',
+                'fichierSource',
+              ],
             },
           },
-          required: ['questions'],
         },
+        required: ['questions'],
       },
     },
-    signal
-  );
+  });
 
   let parsed: {questions?: unknown};
   try {
@@ -296,7 +561,7 @@ export async function generateFolderQuiz(params: {
     throw new Error('Aucune question valide n’a pu être extraite de la réponse Gemini.');
   }
 
-  return sanitized;
+  return {questions: sanitized, modelUsed};
 }
 
 export async function askGeminiSelectionExplain(params: {
@@ -310,8 +575,16 @@ export async function askGeminiSelectionExplain(params: {
   history: GeminiChatTurn[];
   followUpQuestion?: string;
   signal?: AbortSignal;
-}): Promise<string> {
-  const {selectedText, courseContext, history, followUpQuestion, signal} = params;
+  onStatus?: (message: string) => void;
+}): Promise<GeminiCallResult> {
+  const {
+    selectedText,
+    courseContext,
+    history,
+    followUpQuestion,
+    signal,
+    onStatus,
+  } = params;
 
   const systemText = [
     `Tu es un assistant pédagogique universitaire rigoureux et synthétique qui répond en français.`,
@@ -328,15 +601,12 @@ export async function askGeminiSelectionExplain(params: {
   ].join('\n');
 
   const contents: Array<{role: 'user' | 'model'; parts: Array<{text: string}>}> = [];
+  const initialUserPrompt = `Explique clairement ce passage ou terme dans le contexte de mon cours de ${courseContext.subject} :\n\n« ${selectedText} »`;
 
   if (history.length === 0) {
     contents.push({
       role: 'user',
-      parts: [
-        {
-          text: `Explique clairement ce passage ou terme dans le contexte de mon cours de ${courseContext.subject} :\n\n« ${selectedText} »`,
-        },
-      ],
+      parts: [{text: initialUserPrompt}],
     });
   } else {
     for (const turn of history) {
@@ -353,16 +623,15 @@ export async function askGeminiSelectionExplain(params: {
     }
   }
 
-  return callGeminiGenerateContent(
-    {
-      systemInstruction: {
-        parts: [{text: systemText}],
-      },
-      contents,
-      generationConfig: {
-        temperature: 0.4,
-      },
+  return appelerGeminiAvecSecours(followUpQuestion?.trim() || initialUserPrompt, {
+    systemInstruction: {
+      parts: [{text: systemText}],
     },
-    signal
-  );
+    contents,
+    generationConfig: {
+      temperature: 0.4,
+    },
+    signal,
+    onStatus,
+  });
 }

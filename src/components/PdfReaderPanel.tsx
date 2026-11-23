@@ -791,6 +791,8 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   const [drawerSelection, setDrawerSelection] = useState('');
   const [chatHistory, setChatHistory] = useState<GeminiChatTurn[]>([]);
   const [isExplaining, setIsExplaining] = useState(false);
+  const [explainStatus, setExplainStatus] = useState<string | null>(null);
+  const [explainModelUsed, setExplainModelUsed] = useState<string | null>(null);
   const [explainError, setExplainError] = useState<string | null>(null);
   const [isMissingApiKey, setIsMissingApiKey] = useState(false);
   const explainAbortRef = useRef<AbortController | null>(null);
@@ -1953,11 +1955,15 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       ];
       setChatHistory(nextHistory);
       setIsExplaining(true);
+      setExplainStatus(null);
+      if (priorHistory.length === 0) {
+        setExplainModelUsed(null);
+      }
       setExplainError(null);
       setIsMissingApiKey(false);
 
       try {
-        const answer = await askGeminiSelectionExplain({
+        const {text: answer, modelUsed} = await askGeminiSelectionExplain({
           selectedText: snippet,
           courseContext: {
             displayTitle,
@@ -1968,8 +1974,12 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
           history: priorHistory,
           followUpQuestion: followUp,
           signal: controller.signal,
+          onStatus: (statusMsg) => {
+            setExplainStatus(statusMsg);
+          },
         });
         if (controller.signal.aborted) return;
+        setExplainModelUsed(modelUsed);
         setChatHistory((prev) => [...prev, {role: 'model', text: answer}]);
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') return;
@@ -1982,6 +1992,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       } finally {
         if (!controller.signal.aborted) {
           setIsExplaining(false);
+          setExplainStatus(null);
         }
       }
     },
@@ -2377,6 +2388,8 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
           selectedText={drawerSelection}
           chatHistory={chatHistory}
           isExplaining={isExplaining}
+          explainStatus={explainStatus}
+          modelUsed={explainModelUsed}
           explainError={explainError}
           isMissingApiKey={isMissingApiKey}
           onAskFollowUp={(q) => {

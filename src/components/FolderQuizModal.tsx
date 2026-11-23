@@ -11,12 +11,14 @@ import {
   RotateCcw,
   Settings,
   Sparkles,
+  WifiOff,
   X,
   XCircle,
 } from 'lucide-react';
 import type {
   AppMode,
   CloudSearchIndexPayload,
+  CourseDocument,
   QuizFolderTarget,
   QuizFormatPreference,
   QuizQuestion,
@@ -30,8 +32,11 @@ import {
 import {
   generateFolderQuiz,
   getEffectiveGeminiApiKey,
+  getSavedGeminiModel,
+  isGeminiAllModelsUnavailableError,
   isGeminiMissingKeyError,
 } from '../services/gemini';
+import {generateOfflineFolderQuiz} from '../services/offlineQuiz';
 import {
   collectFolderContentForQuiz,
   type QuizContentProgress,
@@ -67,6 +72,45 @@ function areOpenAnswersCloseEnough(userAnswer: string, expected: string): boolea
   return false;
 }
 
+function getParentDirKey(relativePath: string): string {
+  const normalized = relativePath.replace(/\\/g, '/').trim();
+  const lastSlash = normalized.lastIndexOf('/');
+  return lastSlash === -1 ? '' : normalized.slice(0, lastSlash).toLowerCase();
+}
+
+function getNormalizedBaseName(fileName: string): string {
+  const withoutExt = fileName.replace(/\.(pdf|docx|odt)$/i, '');
+  return withoutExt.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function isPdfDoc(doc: CourseDocument): boolean {
+  return doc.format === 'pdf' || doc.name.toLowerCase().endsWith('.pdf');
+}
+
+function isOfficeDoc(doc: CourseDocument): boolean {
+  const lower = doc.name.toLowerCase();
+  return (
+    doc.format === 'docx' ||
+    doc.format === 'odt' ||
+    lower.endsWith('.docx') ||
+    lower.endsWith('.odt')
+  );
+}
+
+function computeDeduplicatedDocuments(documents: CourseDocument[]): CourseDocument[] {
+  const pdfKeys = new Set<string>();
+  for (const doc of documents) {
+    if (isPdfDoc(doc)) {
+      pdfKeys.add(`${getParentDirKey(doc.relativePath)}::${getNormalizedBaseName(doc.name)}`);
+    }
+  }
+  return documents.filter((doc) => {
+    if (!isOfficeDoc(doc)) return true;
+    const key = `${getParentDirKey(doc.relativePath)}::${getNormalizedBaseName(doc.name)}`;
+    return !pdfKeys.has(key);
+  });
+}
+
 export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
   target,
   mode,
@@ -78,13 +122,17 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
 }) => {
   const [phase, setPhase] = useState<QuizModalPhase>('config');
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(() => new Set());
+  const [showOfficeDuplicates, setShowOfficeDuplicates] = useState(false);
   const [questionCount, setQuestionCount] = useState<5 | 10 | 15>(10);
   const [quizFormat, setQuizFormat] = useState<QuizFormatPreference>('mixte');
 
   const [loadingProgress, setLoadingProgress] = useState<QuizContentProgress | null>(null);
   const [loadingStepLabel, setLoadingStepLabel] = useState('');
+  const [fallbackStatusMessage, setFallbackStatusMessage] = useState<string | null>(null);
+  const [usedModelLabel, setUsedModelLabel] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isMissingKeyErr, setIsMissingKeyErr] = useState(false);
+  const [offerOfflineFallback, setOfferOfflineFallback] = useState(false);
 
   const [questions, setQuestions] = useState<QuizQuestion[]>([]);
   const [currentIdx, setCurrentIdx] = useState(0);
@@ -100,10 +148,15 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
       return;
     }
 
+    const dedup = computeDeduplicatedDocuments(target.documents);
     setPhase('config');
-    setSelectedPaths(new Set(target.documents.map((d) => d.relativePath)));
+    setShowOfficeDuplicates(false);
+    setSelectedPaths(new Set(dedup.map((d) => d.relativePath)));
     setErrorMessage(null);
     setIsMissingKeyErr(false);
+    setOfferOfflineFallback(false);
+    setFallbackStatusMessage(null);
+    setUsedModelLabel(null);
     setLoadingProgress(null);
     setLoadingStepLabel('');
     setQuestions([]);
@@ -118,16 +171,30 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
     };
   }, []);
 
-  const selectedDocs = useMemo(() => {
+  const deduplicatedDocuments = useMemo(() => {
     if (!target) return [];
-    return target.documents.filter((d) => selectedPaths.has(d.relativePath));
-  }, [target, selectedPaths]);
+    return computeDeduplicatedDocuments(target.documents);
+  }, [target]);
+
+  const hiddenDuplicateCount = target
+    ? target.documents.length - deduplicatedDocuments.length
+    : 0;
+
+  const visibleDocuments = useMemo(() => {
+    if (!target) return [];
+    return showOfficeDuplicates ? target.documents : deduplicatedDocuments;
+  }, [target, showOfficeDuplicates, deduplicatedDocuments]);
+
+  const selectedDocs = useMemo(() => {
+    return visibleDocuments.filter((d) => selectedPaths.has(d.relativePath));
+  }, [visibleDocuments, selectedPaths]);
 
   if (!target) return null;
 
   const hasApiKey = getEffectiveGeminiApiKey().length > 0;
   const allChecked =
-    target.documents.length > 0 && selectedPaths.size === target.documents.length;
+    visibleDocuments.length > 0 &&
+    visibleDocuments.every((d) => selectedPaths.has(d.relativePath));
 
   const toggleDoc = (relativePath: string) => {
     setSelectedPaths((prev) => {
@@ -142,7 +209,7 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
     if (allChecked) {
       setSelectedPaths(new Set());
     } else {
-      setSelectedPaths(new Set(target.documents.map((d) => d.relativePath)));
+      setSelectedPaths(new Set(visibleDocuments.map((d) => d.relativePath)));
     }
   };
 
@@ -151,8 +218,9 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
 
     if (!getEffectiveGeminiApiKey()) {
       setIsMissingKeyErr(true);
+      setOfferOfflineFallback(true);
       setErrorMessage(
-        'Aucune clé API Google Gemini configurée. Collez votre clé dans Paramètres → Clé API Google Gemini.'
+        'Aucune clé API Google Gemini configurée. Collez votre clé dans Paramètres → Clé API Google Gemini, ou utilisez le quiz rapide hors-ligne.'
       );
       return;
     }
@@ -164,6 +232,9 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
     setPhase('loading');
     setErrorMessage(null);
     setIsMissingKeyErr(false);
+    setOfferOfflineFallback(false);
+    setFallbackStatusMessage(null);
+    setUsedModelLabel(null);
     setLoadingProgress(null);
     setLoadingStepLabel('Préparation des cours du dossier…');
 
@@ -192,20 +263,25 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
 
       setLoadingProgress(null);
       setLoadingStepLabel(
-        `Génération de ${questionCount} questions avec Gemini 2.5 Flash…`
+        `Génération de ${questionCount} questions avec ${getSavedGeminiModel()}…`
       );
 
-      const generated = await generateFolderQuiz({
+      const {questions: generated, modelUsed} = await generateFolderQuiz({
         folderTitle: target.title,
         questionCount,
         format: quizFormat,
         excerpts: contentRes.excerpts,
         signal: controller.signal,
+        onStatus: (statusMsg) => {
+          setFallbackStatusMessage(statusMsg);
+        },
       });
 
       if (controller.signal.aborted) return;
 
       setQuestions(generated);
+      setUsedModelLabel(`Répondu via ${modelUsed}`);
+      setFallbackStatusMessage(null);
       setCurrentIdx(0);
       setAnswers({});
       setOpenDraft('');
@@ -216,10 +292,77 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
         return;
       }
       setIsMissingKeyErr(isGeminiMissingKeyError(err));
+      setOfferOfflineFallback(isGeminiAllModelsUnavailableError(err));
+      setFallbackStatusMessage(null);
       setErrorMessage(
         err instanceof Error
           ? err.message
           : 'Impossible de générer le quiz pour ce dossier.'
+      );
+      setPhase('config');
+    }
+  };
+
+  const handleGenerateOfflineQuiz = async () => {
+    if (selectedDocs.length === 0) return;
+
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    setPhase('loading');
+    setErrorMessage(null);
+    setIsMissingKeyErr(false);
+    setOfferOfflineFallback(false);
+    setFallbackStatusMessage(null);
+    setUsedModelLabel(null);
+    setLoadingProgress(null);
+    setLoadingStepLabel('Analyse locale des définitions et notions clés…');
+
+    try {
+      const contentRes = await collectFolderContentForQuiz(selectedDocs, {
+        mode,
+        cloudIndex,
+        signal: controller.signal,
+        onProgress: (p) => {
+          setLoadingProgress(p);
+          setLoadingStepLabel(
+            p.phase === 'index'
+              ? `Lecture depuis l’index (${p.current}/${p.total})`
+              : `Extraction locale du texte (${p.current}/${p.total})`
+          );
+        },
+      });
+
+      if (controller.signal.aborted) return;
+
+      if (contentRes.excerpts.length === 0) {
+        throw new Error(
+          'Aucun texte exploitable n’a pu être extrait des fichiers cochés (PDF scannés ou fichiers vides).'
+        );
+      }
+
+      const generated = generateOfflineFolderQuiz({
+        excerpts: contentRes.excerpts,
+        questionCount,
+        format: quizFormat,
+      });
+
+      setQuestions(generated);
+      setUsedModelLabel('Mode hors-ligne (sans IA)');
+      setCurrentIdx(0);
+      setAnswers({});
+      setOpenDraft('');
+      setPhase('quiz');
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setPhase('config');
+        return;
+      }
+      setErrorMessage(
+        err instanceof Error
+          ? err.message
+          : 'Impossible de générer le quiz hors-ligne pour ce dossier.'
       );
       setPhase('config');
     }
@@ -308,13 +451,20 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
               <Brain className="w-4 h-4 text-amber-400" />
             </div>
             <div className="min-w-0">
-              <h2 className="font-display text-sm sm:text-base font-semibold text-slate-100 truncate">
-                Quiz IA — {target.title}
-              </h2>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="font-display text-sm sm:text-base font-semibold text-slate-100 truncate">
+                  Quiz — {target.title}
+                </h2>
+                {usedModelLabel && (phase === 'quiz' || phase === 'summary') && (
+                  <span className="rounded border border-slate-700 bg-slate-800/80 px-1.5 py-0.5 font-mono text-[10px] text-slate-300 shrink-0">
+                    {usedModelLabel}
+                  </span>
+                )}
+              </div>
               <p className="text-[11px] text-slate-400 truncate">
                 {phase === 'config'
-                  ? `${selectedDocs.length}/${target.documents.length} fichier${
-                      target.documents.length > 1 ? 's' : ''
+                  ? `${selectedDocs.length}/${visibleDocuments.length} fichier${
+                      visibleDocuments.length > 1 ? 's' : ''
                     } sélectionné${selectedDocs.length > 1 ? 's' : ''}`
                   : phase === 'loading'
                   ? 'Préparation du test de connaissances…'
@@ -346,7 +496,7 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
             <div className="space-y-5">
               {(!hasApiKey || errorMessage) && (
                 <div
-                  className={`rounded-lg border p-3.5 text-xs space-y-2 ${
+                  className={`rounded-lg border p-3.5 text-xs space-y-2.5 ${
                     errorMessage
                       ? 'border-rose-500/40 bg-rose-500/10 text-rose-200'
                       : 'border-amber-500/35 bg-amber-500/10 text-amber-200'
@@ -356,22 +506,34 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
                     <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                     <p className="leading-relaxed">
                       {errorMessage ||
-                        'Aucune clé API Google Gemini configurée. Renseignez votre clé dans Paramètres pour générer un quiz.'}
+                        'Aucune clé API Google Gemini configurée. Renseignez votre clé dans Paramètres pour générer un quiz IA, ou lancez un quiz rapide hors-ligne.'}
                     </p>
                   </div>
-                  {(isMissingKeyErr || !hasApiKey) && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        onClose();
-                        onOpenSettings();
-                      }}
-                      className="inline-flex items-center gap-1.5 rounded-md bg-amber-500 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-amber-400 cursor-pointer"
-                    >
-                      <Settings className="w-3.5 h-3.5" />
-                      <span>Ouvrir les Paramètres</span>
-                    </button>
-                  )}
+                  <div className="flex flex-wrap items-center gap-2">
+                    {(isMissingKeyErr || !hasApiKey) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onClose();
+                          onOpenSettings();
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-amber-500 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-amber-400 cursor-pointer"
+                      >
+                        <Settings className="w-3.5 h-3.5" />
+                        <span>Ouvrir les Paramètres</span>
+                      </button>
+                    )}
+                    {offerOfflineFallback && selectedDocs.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => void handleGenerateOfflineQuiz()}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-100 hover:border-amber-400 hover:text-amber-200 cursor-pointer"
+                      >
+                        <WifiOff className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Générer un quiz rapide hors-ligne (sans IA)</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -379,7 +541,7 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-2">
                   <label className="text-xs font-semibold text-slate-200">
-                    Fichiers inclus dans le quiz ({selectedDocs.length}/{target.documents.length})
+                    Fichiers inclus dans le quiz ({selectedDocs.length}/{visibleDocuments.length})
                   </label>
                   <button
                     type="button"
@@ -391,7 +553,7 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
                 </div>
 
                 <div className="max-h-52 overflow-y-auto rounded-lg border border-slate-800 bg-[#0B1120] divide-y divide-slate-800/70">
-                  {target.documents.map((doc) => {
+                  {visibleDocuments.map((doc) => {
                     const checked = selectedPaths.has(doc.relativePath);
                     const displayTitle = formatCourseDisplayTitle(doc.name, titleFormat, {
                       subject: doc.subject,
@@ -425,6 +587,23 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
                     );
                   })}
                 </div>
+
+                {(hiddenDuplicateCount > 0 || showOfficeDuplicates) && (
+                  <label className="flex items-center gap-2 pt-0.5 text-[11px] text-slate-400 cursor-pointer select-none hover:text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={showOfficeDuplicates}
+                      onChange={(e) => setShowOfficeDuplicates(e.target.checked)}
+                      className="accent-amber-500 rounded cursor-pointer shrink-0"
+                    />
+                    <span>
+                      Afficher aussi les doublons Word/LibreOffice (.docx/.odt)
+                      {!showOfficeDuplicates && hiddenDuplicateCount > 0
+                        ? ` (${hiddenDuplicateCount} masqué${hiddenDuplicateCount > 1 ? 's' : ''})`
+                        : ''}
+                    </span>
+                  </label>
+                )}
               </div>
 
               {/* Count + Format */}
@@ -487,10 +666,15 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
               <div className="w-12 h-12 rounded-2xl border border-amber-500/30 bg-amber-500/10 flex items-center justify-center">
                 <Loader2 className="w-6 h-6 text-amber-400 animate-spin" />
               </div>
-              <div className="space-y-1 max-w-md">
+              <div className="space-y-1.5 max-w-md">
                 <p className="text-sm font-medium text-slate-100">
                   {loadingStepLabel || 'Génération du quiz en cours…'}
                 </p>
+                {fallbackStatusMessage && (
+                  <p className="text-xs text-amber-300/90 leading-snug">
+                    {fallbackStatusMessage}
+                  </p>
+                )}
                 {loadingProgress && (
                   <p className="text-xs text-slate-400 truncate">
                     {loadingProgress.fileName}
@@ -786,15 +970,26 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
               >
                 Fermer
               </button>
-              <button
-                type="button"
-                disabled={selectedDocs.length === 0}
-                onClick={() => void handleGenerateQuiz()}
-                className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:opacity-45 cursor-pointer"
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>Générer le quiz</span>
-              </button>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={selectedDocs.length === 0}
+                  onClick={() => void handleGenerateOfflineQuiz()}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800/80 px-3 py-2 text-xs font-medium text-slate-200 hover:border-amber-500/50 hover:text-amber-200 disabled:opacity-45 cursor-pointer"
+                >
+                  <WifiOff className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  <span>Générer un quiz rapide hors-ligne (sans IA)</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={selectedDocs.length === 0}
+                  onClick={() => void handleGenerateQuiz()}
+                  className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:opacity-45 cursor-pointer"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Générer le quiz</span>
+                </button>
+              </div>
             </>
           )}
 

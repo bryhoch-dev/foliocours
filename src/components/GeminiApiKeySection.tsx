@@ -1,9 +1,12 @@
 import React, {useEffect, useState} from 'react';
 import {Check, Eye, EyeOff, Sparkles, Trash2} from 'lucide-react';
 import {
+  DEFAULT_GEMINI_MODEL,
   getSavedGeminiApiKey,
+  getSavedGeminiModel,
   hasEnvFallbackGeminiKey,
   saveGeminiApiKey,
+  saveGeminiModel,
 } from '../services/gemini';
 
 interface GeminiApiKeySectionProps {
@@ -14,20 +17,25 @@ export const GeminiApiKeySection: React.FC<GeminiApiKeySectionProps> = ({
   compact = false,
 }) => {
   const [apiKeyDraft, setApiKeyDraft] = useState(getSavedGeminiApiKey);
+  const [modelDraft, setModelDraft] = useState(getSavedGeminiModel);
   const [showKey, setShowKey] = useState(false);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
   const hasEnvFallback = hasEnvFallbackGeminiKey();
 
   useEffect(() => {
     setApiKeyDraft(getSavedGeminiApiKey());
+    setModelDraft(getSavedGeminiModel());
   }, []);
 
   const handleSave = () => {
     saveGeminiApiKey(apiKeyDraft);
+    const cleanedModel = modelDraft.trim() || DEFAULT_GEMINI_MODEL;
+    saveGeminiModel(cleanedModel);
+    setModelDraft(cleanedModel);
     setSavedNotice(
       apiKeyDraft.trim()
-        ? 'Clé API Google Gemini enregistrée localement.'
-        : 'Clé API locale effacée.'
+        ? 'Clé API et modèle Gemini enregistrés localement.'
+        : `Modèle (${cleanedModel}) enregistré · Clé API locale effacée.`
     );
     setTimeout(() => setSavedNotice(null), 2600);
   };
@@ -68,8 +76,7 @@ export const GeminiApiKeySection: React.FC<GeminiApiKeySectionProps> = ({
       </div>
 
       <p className="text-xs text-slate-400 leading-relaxed">
-        Requise pour générer les quiz de dossier et expliquer des passages dans le lecteur (modèle{' '}
-        <span className="font-mono text-slate-300">gemini-2.5-flash</span>). Stockée uniquement dans ce navigateur.
+        Requise pour générer les quiz de dossier et expliquer des passages dans le lecteur (bascule automatique si un modèle est saturé).
       </p>
 
       <div className="flex gap-2">
@@ -124,6 +131,29 @@ export const GeminiApiKeySection: React.FC<GeminiApiKeySectionProps> = ({
             <Trash2 className="w-3.5 h-3.5" />
           </button>
         )}
+      </div>
+
+      <div className="flex items-center gap-2">
+        <label
+          htmlFor={compact ? 'gemini-model-mobile' : 'gemini-model-desktop'}
+          className="text-[11px] text-slate-400 shrink-0"
+        >
+          Modèle prioritaire :
+        </label>
+        <input
+          id={compact ? 'gemini-model-mobile' : 'gemini-model-desktop'}
+          type="text"
+          value={modelDraft}
+          onChange={(e) => setModelDraft(e.target.value)}
+          onBlur={() => {
+            const cleaned = modelDraft.trim() || DEFAULT_GEMINI_MODEL;
+            saveGeminiModel(cleaned);
+            setModelDraft(cleaned);
+          }}
+          placeholder={DEFAULT_GEMINI_MODEL}
+          spellCheck={false}
+          className="flex-1 min-w-0 rounded-lg border border-slate-800 bg-[#0B1120] px-2.5 py-1.5 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:border-amber-500/60 focus:outline-none"
+        />
       </div>
 
       {savedNotice && <p className="text-xs text-emerald-400">{savedNotice}</p>}
