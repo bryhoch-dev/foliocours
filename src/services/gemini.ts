@@ -6,24 +6,24 @@ import type {
 
 const GEMINI_API_KEY_STORAGE_KEY = 'foliocours_gemini_api_key';
 const GEMINI_MODEL_STORAGE_KEY = 'foliocours_gemini_model';
-const GEMINI_MODELS_CACHE_STORAGE_KEY = 'foliocours_gemini_models_cache_v1';
+const GEMINI_MODELS_CACHE_STORAGE_KEY = 'foliocours_gemini_models_cache_v2';
 const GEMINI_FAST_MODEL_SESSION_KEY = 'gemini_fast_model';
 export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 const STATIC_FALLBACK_MODELS = [
-  'gemini-3.8-flash-lite',
-  'gemini-2.5-flash-lite',
   'gemini-3.8-flash',
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
-  'gemini-2.5-pro',
+  'gemini-3.8-flash-lite',
+  'gemini-3.8-pro',
+  'gemma-3-27b-it',
+  'gemma-3-12b-it',
 ];
 
 const MODEL_DISCOVERY_TTL_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
-const QUIZ_REQUEST_TIMEOUT_MS = 12000;
-const EXPLAIN_REQUEST_TIMEOUT_MS = 5000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
+const QUIZ_REQUEST_TIMEOUT_MS = 30000;
+const EXPLAIN_REQUEST_TIMEOUT_MS = 15000;
+const PRIMARY_TRANSIENT_RETRY_DELAY_MS = 1500;
 
 interface CachedModelsRecord {
   keyTag: string;
@@ -73,11 +73,53 @@ function getApiKeyTag(apiKey: string): string {
   return `${apiKey.length}:${apiKey.slice(-6)}`;
 }
 
+function isLegacyClosedModel(rawName: string): boolean {
+  const lower = normalizeModelName(rawName).toLowerCase();
+  return lower.includes('gemini-1.') || lower.includes('gemini-2.');
+}
+
+function sanitizeStoredGeminiModels(): string {
+  if (typeof window === 'undefined') return DEFAULT_GEMINI_MODEL;
+  let resolved = DEFAULT_GEMINI_MODEL;
+
+  try {
+    const raw = localStorage.getItem(GEMINI_MODEL_STORAGE_KEY)?.trim() ?? '';
+    if (raw) {
+      const normalized = normalizeModelName(raw);
+      if (isLegacyClosedModel(normalized) || !isEligibleTextGeminiModel(normalized)) {
+        localStorage.removeItem(GEMINI_MODEL_STORAGE_KEY);
+        resolved = DEFAULT_GEMINI_MODEL;
+      } else {
+        resolved = normalized;
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+
+  try {
+    const fast = sessionStorage.getItem(GEMINI_FAST_MODEL_SESSION_KEY)?.trim() ?? '';
+    if (fast && (isLegacyClosedModel(fast) || !isEligibleTextGeminiModel(fast))) {
+      sessionStorage.removeItem(GEMINI_FAST_MODEL_SESSION_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+
+  return resolved;
+}
+
 function getSessionFastModel(): string {
   if (typeof window === 'undefined') return '';
   try {
     const val = sessionStorage.getItem(GEMINI_FAST_MODEL_SESSION_KEY)?.trim() ?? '';
-    return val ? normalizeModelName(val) : '';
+    if (!val) return '';
+    const norm = normalizeModelName(val);
+    if (isLegacyClosedModel(norm) || !isEligibleTextGeminiModel(norm)) {
+      sessionStorage.removeItem(GEMINI_FAST_MODEL_SESSION_KEY);
+      return '';
+    }
+    return norm;
   } catch {
     return '';
   }
@@ -86,7 +128,13 @@ function getSessionFastModel(): string {
 function saveSessionFastModel(model: string): void {
   if (typeof window === 'undefined') return;
   const cleaned = normalizeModelName(model);
-  if (!cleaned) return;
+  if (
+    !cleaned ||
+    isLegacyClosedModel(cleaned) ||
+    !cleaned.toLowerCase().startsWith('gemini-')
+  ) {
+    return;
+  }
   try {
     sessionStorage.setItem(GEMINI_FAST_MODEL_SESSION_KEY, cleaned);
   } catch {
@@ -108,6 +156,7 @@ function clearModelsDiscoveryCache(): void {
   if (typeof window === 'undefined') return;
   try {
     localStorage.removeItem(GEMINI_MODELS_CACHE_STORAGE_KEY);
+    localStorage.removeItem('foliocours_gemini_models_cache_v1');
   } catch {
     // ignore storage errors
   }
@@ -130,21 +179,17 @@ export function saveGeminiApiKey(apiKey: string): void {
 }
 
 export function getSavedGeminiModel(): string {
-  if (typeof window === 'undefined') return DEFAULT_GEMINI_MODEL;
-  try {
-    const saved = localStorage.getItem(GEMINI_MODEL_STORAGE_KEY)?.trim();
-    return saved ? normalizeModelName(saved) : DEFAULT_GEMINI_MODEL;
-  } catch {
-    return DEFAULT_GEMINI_MODEL;
-  }
+  return sanitizeStoredGeminiModels();
 }
 
 export function saveGeminiModel(model: string): void {
   if (typeof window === 'undefined') return;
   const cleaned = normalizeModelName(model.trim());
+  const safeModel =
+    !cleaned || isLegacyClosedModel(cleaned) ? DEFAULT_GEMINI_MODEL : cleaned;
   try {
-    if (cleaned && cleaned !== DEFAULT_GEMINI_MODEL) {
-      localStorage.setItem(GEMINI_MODEL_STORAGE_KEY, cleaned);
+    if (safeModel && safeModel !== DEFAULT_GEMINI_MODEL) {
+      localStorage.setItem(GEMINI_MODEL_STORAGE_KEY, safeModel);
     } else {
       localStorage.removeItem(GEMINI_MODEL_STORAGE_KEY);
     }
@@ -182,34 +227,50 @@ interface GeminiModelsListResponse {
 function isEligibleTextGeminiModel(rawName: string, methods?: string[]): boolean {
   if (methods && !methods.includes('generateContent')) return false;
   const name = normalizeModelName(rawName).toLowerCase();
-  if (!name.includes('gemini')) return false;
-  if (!name.includes('flash') && !name.includes('pro')) return false;
-  if (/(vision|embedding|image|tts)/i.test(name)) return false;
-  return true;
+  if (!name) return false;
+
+  // Strictly exclude closed legacy models & non-text specialized models
+  if (/(gemini-1\.|gemini-2\.|embedding|vision|image|tts|aqa)/i.test(name)) {
+    return false;
+  }
+
+  // Only keep active gemini-3+ and gemma-3+ families
+  const isGemini3OrAbove = /^gemini-([3-9]|[1-9]\d+)(\.|-|$)/.test(name);
+  const isGemma3OrAbove = /^gemma-([3-9]|[1-9]\d+)(\.|-|$)/.test(name);
+  return isGemini3OrAbove || isGemma3OrAbove;
 }
 
 function scoreDiscoveredModel(modelName: string): number {
   const lower = modelName.toLowerCase();
   let score = 0;
 
-  // Prioritize lighter/faster models first: flash-lite -> flash -> pro
-  const isLite =
-    lower.includes('flash-lite') ||
-    (lower.includes('flash') && lower.includes('lite'));
-  if (isLite) score += 300;
-  else if (lower.includes('flash')) score += 200;
-  else if (lower.includes('pro')) score += 100;
+  // Always rank Gemini 3+ variants ahead of Gemma 3 last-resort models
+  if (lower.startsWith('gemini-')) {
+    score += 1000;
+    if (lower === 'gemini-3.8-flash') score += 300;
+    else if (lower.includes('flash-lite') || (lower.includes('flash') && lower.includes('lite'))) {
+      score += 220;
+    } else if (lower.includes('flash')) {
+      score += 200;
+    } else if (lower.includes('pro')) {
+      score += 120;
+    }
+    if (lower.includes('3.8')) score += 40;
+    else if (lower.includes('3.')) score += 20;
+  } else if (lower.startsWith('gemma-')) {
+    score += 100;
+    if (lower === 'gemma-3-27b-it') score += 50;
+    else if (lower === 'gemma-3-12b-it') score += 40;
+    else if (lower.includes('27b')) score += 30;
+    else if (lower.includes('12b')) score += 20;
+  }
 
   if (lower.includes('latest')) score += 4;
-  if (lower.includes('3.8')) score += 40;
-  else if (lower.includes('3.')) score += 35;
-  else if (lower.includes('2.5')) score += 30;
-  else if (lower.includes('2.0')) score += 20;
-  else if (lower.includes('1.5')) score += 10;
-
   if (lower.includes('exp') || lower.includes('preview')) score -= 3;
   return score;
 }
+
+sanitizeStoredGeminiModels();
 
 function readCachedModelsFromStorage(keyTag: string): string[] | null {
   if (
@@ -233,7 +294,12 @@ function readCachedModelsFromStorage(keyTag: string): string[] | null {
       parsed.models.length > 0
     ) {
       const cleaned = parsed.models
-        .filter((m): m is string => typeof m === 'string' && m.trim().length > 0)
+        .filter(
+          (m): m is string =>
+            typeof m === 'string' &&
+            m.trim().length > 0 &&
+            isEligibleTextGeminiModel(m)
+        )
         .map((m) => normalizeModelName(m))
         .sort((a, b) => scoreDiscoveredModel(b) - scoreDiscoveredModel(a));
       cachedModelsEntry = {
@@ -376,10 +442,77 @@ export interface GeminiCallResult {
   modelUsed: string;
 }
 
+function isTransientHighDemandFailure(status: number, message: string): boolean {
+  if (status === 429 || status === 503) return true;
+  return /high demand|overloaded|rate limit|resource exhausted/i.test(message);
+}
+
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(new DOMException('Requête annulée.', 'AbortError'));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Requête annulée.', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, {once: true});
+  });
+}
+
+function buildUniversalContents(
+  prompt: string,
+  options: GeminiCallOptions
+): Array<{role: 'user' | 'model'; parts: Array<{text: string}>}> {
+  const sysText = (options.systemInstruction?.parts ?? [])
+    .map((p) => p.text)
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+
+  const baseContents =
+    options.contents && options.contents.length > 0
+      ? options.contents.map((turn) => ({
+          role: turn.role,
+          parts: turn.parts.map((part) => ({text: part.text})),
+        }))
+      : [
+          {
+            role: 'user' as const,
+            parts: [{text: prompt}],
+          },
+        ];
+
+  if (sysText) {
+    const firstUserIdx = baseContents.findIndex((t) => t.role === 'user');
+    if (firstUserIdx !== -1) {
+      const existing = baseContents[firstUserIdx].parts.map((p) => p.text).join('\n');
+      baseContents[firstUserIdx] = {
+        role: 'user',
+        parts: [{text: `${sysText}\n\n${existing}`}],
+      };
+    } else {
+      baseContents.unshift({
+        role: 'user',
+        parts: [{text: sysText}],
+      });
+    }
+  }
+
+  return baseContents;
+}
+
 /**
- * Centralized Gemini caller with fast session model memorization,
- * 24h localStorage model list caching, per-attempt AbortController timeouts,
- * and instant automatic fallback on timeout or saturation/unavailability.
+ * Centralized Gemini/Gemma caller:
+ * - Strictly excludes legacy gemini-1.x / gemini-2.x models
+ * - Prioritizes gemini-3.8-flash (with 1.5s retry on 429/503/high demand),
+ *   then remaining gemini-3+ variants, then gemma-3-27b-it / gemma-3-12b-it
+ * - Omits systemInstruction & responseMimeType for universal Gemini 3 + Gemma 3 compatibility
+ * - Surfaces the first model's error if all models fail
  */
 export async function appelerGeminiAvecSecours(
   prompt: string,
@@ -390,44 +523,63 @@ export async function appelerGeminiAvecSecours(
     throw new GeminiMissingKeyError();
   }
 
-  const fastSessionModel = getSessionFastModel();
-  const preferred = normalizeModelName(
-    options.preferredModel?.trim() || getSavedGeminiModel()
+  const sanitizedSaved = sanitizeStoredGeminiModels();
+  const rawPreferred = normalizeModelName(
+    options.preferredModel?.trim() || sanitizedSaved
   );
+  const preferred =
+    !rawPreferred || isLegacyClosedModel(rawPreferred) || !isEligibleTextGeminiModel(rawPreferred)
+      ? DEFAULT_GEMINI_MODEL
+      : rawPreferred;
+
+  const fastSessionModel = getSessionFastModel();
   const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
   const discovered = await discoverCompatibleModels(apiKey, options.signal);
+  const discoveredGemini3 = discovered.filter((m) =>
+    m.toLowerCase().startsWith('gemini-')
+  );
+  const discoveredGemma3 = discovered.filter((m) =>
+    m.toLowerCase().startsWith('gemma-')
+  );
+  const staticGemini3 = STATIC_FALLBACK_MODELS.filter((m) =>
+    m.toLowerCase().startsWith('gemini-')
+  );
+  const staticGemma3 = STATIC_FALLBACK_MODELS.filter((m) =>
+    m.toLowerCase().startsWith('gemma-')
+  );
+
   const candidateModels = Array.from(
     new Set([
       ...(fastSessionModel ? [fastSessionModel] : []),
-      ...(preferred ? [preferred] : []),
-      ...discovered,
-      ...STATIC_FALLBACK_MODELS,
+      preferred,
+      DEFAULT_GEMINI_MODEL,
+      ...staticGemini3,
+      ...discoveredGemini3,
+      ...staticGemma3,
+      ...discoveredGemma3,
     ])
-  ).filter(
-    (name) =>
-      isEligibleTextGeminiModel(name) ||
-      name === preferred ||
-      name === fastSessionModel
-  );
+  ).filter((name) => isEligibleTextGeminiModel(name));
 
   const payload: Record<string, unknown> = {
-    contents: options.contents ?? [
-      {
-        role: 'user',
-        parts: [{text: prompt}],
-      },
-    ],
+    contents: buildUniversalContents(prompt, options),
   };
 
-  if (options.systemInstruction) {
-    payload.systemInstruction = options.systemInstruction;
-  }
   if (options.generationConfig) {
-    payload.generationConfig = options.generationConfig;
+    const safeGenConfig: Record<string, unknown> = {};
+    if (typeof options.generationConfig.temperature === 'number') {
+      safeGenConfig.temperature = options.generationConfig.temperature;
+    }
+    if (typeof options.generationConfig.maxOutputTokens === 'number') {
+      safeGenConfig.maxOutputTokens = options.generationConfig.maxOutputTokens;
+    }
+    if (Object.keys(safeGenConfig).length > 0) {
+      payload.generationConfig = safeGenConfig;
+    }
   }
 
-  let lastErrorMessage = '';
+  let firstErrorMessage = '';
+  let retriedPrimaryModel = false;
 
   for (let i = 0; i < candidateModels.length; i++) {
     if (options.signal?.aborted) {
@@ -476,8 +628,25 @@ export async function appelerGeminiAvecSecours(
           );
         }
 
+        if (!firstErrorMessage) {
+          firstErrorMessage = `${model} : ${apiMessage}`;
+        }
+
+        if (
+          model === DEFAULT_GEMINI_MODEL &&
+          !retriedPrimaryModel &&
+          isTransientHighDemandFailure(response.status, apiMessage)
+        ) {
+          retriedPrimaryModel = true;
+          options.onStatus?.(
+            `Modèle saturé, nouvelle tentative rapide sur ${model}...`
+          );
+          await abortableSleep(PRIMARY_TRANSIENT_RETRY_DELAY_MS, options.signal);
+          i--;
+          continue;
+        }
+
         if (isRetryableModelFailure(response.status, apiMessage)) {
-          lastErrorMessage = `${model} : ${apiMessage}`;
           if (i < candidateModels.length - 1) {
             options.onStatus?.(
               'Modèle saturé, bascule automatique sur un modèle disponible...'
@@ -496,16 +665,16 @@ export async function appelerGeminiAvecSecours(
         .trim();
 
       if (!text) {
-        lastErrorMessage = `${model} : réponse vide`;
+        if (!firstErrorMessage) {
+          firstErrorMessage = `${model} : réponse vide`;
+        }
         if (i < candidateModels.length - 1) {
           options.onStatus?.(
             'Modèle saturé, bascule automatique sur un modèle disponible...'
           );
           continue;
         }
-        throw new GeminiAllModelsUnavailableError(
-          'Gemini n’a renvoyé aucune réponse exploitable.'
-        );
+        throw new GeminiAllModelsUnavailableError(firstErrorMessage);
       }
 
       saveSessionFastModel(model);
@@ -516,7 +685,9 @@ export async function appelerGeminiAvecSecours(
       }
 
       if (timedOut || (err instanceof DOMException && err.name === 'AbortError')) {
-        lastErrorMessage = `${model} : délai dépassé (${Math.round(timeoutMs / 1000)}s)`;
+        if (!firstErrorMessage) {
+          firstErrorMessage = `${model} : délai dépassé (${Math.round(timeoutMs / 1000)}s)`;
+        }
         if (i < candidateModels.length - 1) {
           options.onStatus?.(
             'Modèle saturé, bascule automatique sur un modèle disponible...'
@@ -539,8 +710,10 @@ export async function appelerGeminiAvecSecours(
       }
 
       const msg = err instanceof Error ? err.message : String(err);
+      if (!firstErrorMessage) {
+        firstErrorMessage = `${model} : ${msg}`;
+      }
       if (isRetryableModelFailure(0, msg)) {
-        lastErrorMessage = msg;
         if (i < candidateModels.length - 1) {
           options.onStatus?.(
             'Modèle saturé, bascule automatique sur un modèle disponible...'
@@ -557,8 +730,8 @@ export async function appelerGeminiAvecSecours(
   }
 
   throw new GeminiAllModelsUnavailableError(
-    lastErrorMessage
-      ? `Tous les modèles Gemini sont actuellement saturés ou indisponibles (${lastErrorMessage}).`
+    firstErrorMessage
+      ? `Tous les modèles sont indisponibles (${firstErrorMessage}).`
       : undefined
   );
 }
@@ -608,55 +781,35 @@ export async function generateFolderQuiz(params: {
     `- "fichierSource" : le nom exact du document source tel qu'indiqué après "DOCUMENT X : ".`,
     `Répartis autant que possible les questions sur l'ensemble des documents fournis.`,
     ``,
+    `FORMAT DE SORTIE STRICT : Réponds UNIQUEMENT avec un objet JSON valide sans aucun texte avant ou après, suivant exactement cette structure :`,
+    `{"questions":[{"question":"...","type":"qcm","options":["...","...","...","..."],"reponseCorrecte":"...","explication":"...","fichierSource":"..."}]}`,
+    ``,
     contextBlock,
   ].join('\n');
 
-  const {text: rawJson, modelUsed} = await appelerGeminiAvecSecours(prompt, {
+  const {text: rawResponse, modelUsed} = await appelerGeminiAvecSecours(prompt, {
     signal,
     onStatus,
     timeoutMs: QUIZ_REQUEST_TIMEOUT_MS,
     generationConfig: {
       temperature: 0.35,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: 'OBJECT',
-        properties: {
-          questions: {
-            type: 'ARRAY',
-            items: {
-              type: 'OBJECT',
-              properties: {
-                question: {type: 'STRING'},
-                type: {type: 'STRING', enum: ['qcm', 'ouverte']},
-                options: {
-                  type: 'ARRAY',
-                  items: {type: 'STRING'},
-                },
-                reponseCorrecte: {type: 'STRING'},
-                explication: {type: 'STRING'},
-                fichierSource: {type: 'STRING'},
-              },
-              required: [
-                'question',
-                'type',
-                'options',
-                'reponseCorrecte',
-                'explication',
-                'fichierSource',
-              ],
-            },
-          },
-        },
-        required: ['questions'],
-      },
     },
   });
 
   let parsed: {questions?: unknown};
   try {
-    parsed = JSON.parse(rawJson) as {questions?: unknown};
+    const cleanedText = rawResponse
+      .replace(/```json\s*/gi, '')
+      .replace(/```/g, '')
+      .trim();
+    const jsonMatch = cleanedText.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+    const jsonPayload = jsonMatch ? jsonMatch[1] : cleanedText;
+    const rawParsed = JSON.parse(jsonPayload) as unknown;
+    parsed = Array.isArray(rawParsed)
+      ? {questions: rawParsed}
+      : (rawParsed as {questions?: unknown});
   } catch {
-    throw new Error('Réponse JSON du quiz invalide retournée par Gemini.');
+    throw new Error('Réponse JSON du quiz invalide retournée par le modèle.');
   }
 
   if (!Array.isArray(parsed.questions) || parsed.questions.length === 0) {
@@ -813,15 +966,22 @@ export async function askGeminiSelectionExplain(params: {
   if (history.length === 0) {
     contents.push({
       role: 'user',
-      parts: [{text: initialUserPrompt}],
+      parts: [{text: `${systemText}\n\n${initialUserPrompt}`}],
     });
   } else {
-    for (const turn of history) {
+    history.forEach((turn, idx) => {
       contents.push({
         role: turn.role,
-        parts: [{text: turn.text}],
+        parts: [
+          {
+            text:
+              idx === 0 && turn.role === 'user'
+                ? `${systemText}\n\n${turn.text}`
+                : turn.text,
+          },
+        ],
       });
-    }
+    });
     if (followUpQuestion?.trim()) {
       contents.push({
         role: 'user',
@@ -831,9 +991,6 @@ export async function askGeminiSelectionExplain(params: {
   }
 
   return appelerGeminiAvecSecours(followUpQuestion?.trim() || initialUserPrompt, {
-    systemInstruction: {
-      parts: [{text: systemText}],
-    },
     contents,
     generationConfig: {
       temperature: 0.3,
