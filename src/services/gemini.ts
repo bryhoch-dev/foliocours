@@ -6,21 +6,32 @@ import type {
 
 const GEMINI_API_KEY_STORAGE_KEY = 'foliocours_gemini_api_key';
 const GEMINI_MODEL_STORAGE_KEY = 'foliocours_gemini_model';
+const GEMINI_MODELS_CACHE_STORAGE_KEY = 'foliocours_gemini_models_cache_v1';
+const GEMINI_FAST_MODEL_SESSION_KEY = 'gemini_fast_model';
 export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 const STATIC_FALLBACK_MODELS = [
-  'gemini-3.8-flash',
   'gemini-3.8-flash-lite',
-  'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
+  'gemini-3.8-flash',
+  'gemini-2.5-flash',
   'gemini-2.0-flash',
   'gemini-2.5-pro',
 ];
 
-const MODEL_DISCOVERY_TTL_MS = 5 * 60 * 1000;
-let cachedModelsEntry: {apiKey: string; fetchedAt: number; models: string[]} | null =
-  null;
+const MODEL_DISCOVERY_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
+const QUIZ_REQUEST_TIMEOUT_MS = 12000;
+const EXPLAIN_REQUEST_TIMEOUT_MS = 5000;
+
+interface CachedModelsRecord {
+  keyTag: string;
+  fetchedAt: number;
+  models: string[];
+}
+
+let cachedModelsEntry: CachedModelsRecord | null = null;
 
 export class GeminiMissingKeyError extends Error {
   constructor() {
@@ -58,6 +69,50 @@ export function getSavedGeminiApiKey(): string {
   }
 }
 
+function getApiKeyTag(apiKey: string): string {
+  return `${apiKey.length}:${apiKey.slice(-6)}`;
+}
+
+function getSessionFastModel(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    const val = sessionStorage.getItem(GEMINI_FAST_MODEL_SESSION_KEY)?.trim() ?? '';
+    return val ? normalizeModelName(val) : '';
+  } catch {
+    return '';
+  }
+}
+
+function saveSessionFastModel(model: string): void {
+  if (typeof window === 'undefined') return;
+  const cleaned = normalizeModelName(model);
+  if (!cleaned) return;
+  try {
+    sessionStorage.setItem(GEMINI_FAST_MODEL_SESSION_KEY, cleaned);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function clearSessionFastModel(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    sessionStorage.removeItem(GEMINI_FAST_MODEL_SESSION_KEY);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function clearModelsDiscoveryCache(): void {
+  cachedModelsEntry = null;
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.removeItem(GEMINI_MODELS_CACHE_STORAGE_KEY);
+  } catch {
+    // ignore storage errors
+  }
+}
+
 export function saveGeminiApiKey(apiKey: string): void {
   if (typeof window === 'undefined') return;
   const trimmed = apiKey.trim();
@@ -70,7 +125,8 @@ export function saveGeminiApiKey(apiKey: string): void {
   } catch {
     // ignore storage errors
   }
-  cachedModelsEntry = null;
+  clearModelsDiscoveryCache();
+  clearSessionFastModel();
 }
 
 export function getSavedGeminiModel(): string {
@@ -95,6 +151,7 @@ export function saveGeminiModel(model: string): void {
   } catch {
     // ignore storage errors
   }
+  clearSessionFastModel();
 }
 
 export function hasEnvFallbackGeminiKey(): boolean {
@@ -134,10 +191,15 @@ function isEligibleTextGeminiModel(rawName: string, methods?: string[]): boolean
 function scoreDiscoveredModel(modelName: string): number {
   const lower = modelName.toLowerCase();
   let score = 0;
-  if (lower.includes('flash')) score += 100;
-  else if (lower.includes('pro')) score += 50;
 
-  if (lower.includes('lite')) score += 5;
+  // Prioritize lighter/faster models first: flash-lite -> flash -> pro
+  const isLite =
+    lower.includes('flash-lite') ||
+    (lower.includes('flash') && lower.includes('lite'));
+  if (isLite) score += 300;
+  else if (lower.includes('flash')) score += 200;
+  else if (lower.includes('pro')) score += 100;
+
   if (lower.includes('latest')) score += 4;
   if (lower.includes('3.8')) score += 40;
   else if (lower.includes('3.')) score += 35;
@@ -149,16 +211,76 @@ function scoreDiscoveredModel(modelName: string): number {
   return score;
 }
 
+function readCachedModelsFromStorage(keyTag: string): string[] | null {
+  if (
+    cachedModelsEntry &&
+    cachedModelsEntry.keyTag === keyTag &&
+    Date.now() - cachedModelsEntry.fetchedAt < MODEL_DISCOVERY_TTL_MS
+  ) {
+    return cachedModelsEntry.models;
+  }
+
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(GEMINI_MODELS_CACHE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<CachedModelsRecord>;
+    if (
+      parsed.keyTag === keyTag &&
+      typeof parsed.fetchedAt === 'number' &&
+      Date.now() - parsed.fetchedAt < MODEL_DISCOVERY_TTL_MS &&
+      Array.isArray(parsed.models) &&
+      parsed.models.length > 0
+    ) {
+      const cleaned = parsed.models
+        .filter((m): m is string => typeof m === 'string' && m.trim().length > 0)
+        .map((m) => normalizeModelName(m))
+        .sort((a, b) => scoreDiscoveredModel(b) - scoreDiscoveredModel(a));
+      cachedModelsEntry = {
+        keyTag,
+        fetchedAt: parsed.fetchedAt,
+        models: cleaned,
+      };
+      return cleaned;
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return null;
+}
+
+function writeCachedModelsToStorage(keyTag: string, models: string[]): void {
+  const record: CachedModelsRecord = {
+    keyTag,
+    fetchedAt: Date.now(),
+    models,
+  };
+  cachedModelsEntry = record;
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(GEMINI_MODELS_CACHE_STORAGE_KEY, JSON.stringify(record));
+  } catch {
+    // ignore storage errors
+  }
+}
+
 async function discoverCompatibleModels(
   apiKey: string,
   signal?: AbortSignal
 ): Promise<string[]> {
-  if (
-    cachedModelsEntry &&
-    cachedModelsEntry.apiKey === apiKey &&
-    Date.now() - cachedModelsEntry.fetchedAt < MODEL_DISCOVERY_TTL_MS
-  ) {
-    return cachedModelsEntry.models;
+  const keyTag = getApiKeyTag(apiKey);
+  const cached = readCachedModelsFromStorage(keyTag);
+  if (cached) return cached;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort('timeout'), 4000);
+  const onExternalAbort = () => controller.abort('external');
+  if (signal) {
+    if (signal.aborted) {
+      clearTimeout(timeoutId);
+      throw new DOMException('Requête annulée.', 'AbortError');
+    }
+    signal.addEventListener('abort', onExternalAbort, {once: true});
   }
 
   try {
@@ -166,7 +288,7 @@ async function discoverCompatibleModels(
       `${GEMINI_API_BASE}/models?key=${encodeURIComponent(apiKey)}`,
       {
         method: 'GET',
-        signal,
+        signal: controller.signal,
       }
     );
     if (!res.ok) {
@@ -183,15 +305,21 @@ async function discoverCompatibleModels(
       .sort((a, b) => scoreDiscoveredModel(b) - scoreDiscoveredModel(a));
 
     const unique = Array.from(new Set(eligible));
-    cachedModelsEntry = {
-      apiKey,
-      fetchedAt: Date.now(),
-      models: unique,
-    };
+    if (unique.length > 0) {
+      writeCachedModelsToStorage(keyTag, unique);
+    }
     return unique;
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') throw err;
+    if (signal?.aborted) {
+      throw new DOMException('Requête annulée.', 'AbortError');
+    }
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      return [];
+    }
     return [];
+  } finally {
+    clearTimeout(timeoutId);
+    signal?.removeEventListener('abort', onExternalAbort);
   }
 }
 
@@ -238,6 +366,7 @@ export interface GeminiCallOptions {
   systemInstruction?: {parts: Array<{text: string}>};
   generationConfig?: Record<string, unknown>;
   preferredModel?: string;
+  timeoutMs?: number;
   signal?: AbortSignal;
   onStatus?: (message: string) => void;
 }
@@ -248,8 +377,9 @@ export interface GeminiCallResult {
 }
 
 /**
- * Centralized Gemini caller with dynamic compatible-model discovery
- * and automatic fallback on saturation / unavailability (429, 500, 503, 404, etc.).
+ * Centralized Gemini caller with fast session model memorization,
+ * 24h localStorage model list caching, per-attempt AbortController timeouts,
+ * and instant automatic fallback on timeout or saturation/unavailability.
  */
 export async function appelerGeminiAvecSecours(
   prompt: string,
@@ -260,18 +390,26 @@ export async function appelerGeminiAvecSecours(
     throw new GeminiMissingKeyError();
   }
 
+  const fastSessionModel = getSessionFastModel();
   const preferred = normalizeModelName(
     options.preferredModel?.trim() || getSavedGeminiModel()
   );
+  const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
   const discovered = await discoverCompatibleModels(apiKey, options.signal);
   const candidateModels = Array.from(
     new Set([
+      ...(fastSessionModel ? [fastSessionModel] : []),
       ...(preferred ? [preferred] : []),
       ...discovered,
       ...STATIC_FALLBACK_MODELS,
     ])
-  ).filter((name) => isEligibleTextGeminiModel(name) || name === preferred);
+  ).filter(
+    (name) =>
+      isEligibleTextGeminiModel(name) ||
+      name === preferred ||
+      name === fastSessionModel
+  );
 
   const payload: Record<string, unknown> = {
     contents: options.contents ?? [
@@ -297,6 +435,17 @@ export async function appelerGeminiAvecSecours(
     }
 
     const model = candidateModels[i];
+    const attemptController = new AbortController();
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      attemptController.abort('timeout');
+    }, timeoutMs);
+
+    const onExternalAbort = () => {
+      attemptController.abort('external');
+    };
+    options.signal?.addEventListener('abort', onExternalAbort, {once: true});
 
     try {
       const response = await fetch(
@@ -307,7 +456,7 @@ export async function appelerGeminiAvecSecours(
             'Content-Type': 'application/json',
           },
           body: JSON.stringify(payload),
-          signal: options.signal,
+          signal: attemptController.signal,
         }
       );
 
@@ -359,11 +508,23 @@ export async function appelerGeminiAvecSecours(
         );
       }
 
+      saveSessionFastModel(model);
       return {text, modelUsed: model};
     } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw err;
+      if (options.signal?.aborted) {
+        throw new DOMException('Requête annulée.', 'AbortError');
       }
+
+      if (timedOut || (err instanceof DOMException && err.name === 'AbortError')) {
+        lastErrorMessage = `${model} : délai dépassé (${Math.round(timeoutMs / 1000)}s)`;
+        if (i < candidateModels.length - 1) {
+          options.onStatus?.(
+            'Modèle saturé, bascule automatique sur un modèle disponible...'
+          );
+        }
+        continue;
+      }
+
       if (
         err instanceof Error &&
         err.message.includes('Clé API Gemini invalide')
@@ -372,7 +533,6 @@ export async function appelerGeminiAvecSecours(
       }
 
       if (err instanceof TypeError) {
-        // Network offline or fetch failure
         throw new GeminiAllModelsUnavailableError(
           'Connexion réseau indisponible pour contacter les serveurs Google Gemini.'
         );
@@ -390,6 +550,9 @@ export async function appelerGeminiAvecSecours(
       }
 
       throw err;
+    } finally {
+      clearTimeout(timeoutId);
+      options.signal?.removeEventListener('abort', onExternalAbort);
     }
   }
 
@@ -451,6 +614,7 @@ export async function generateFolderQuiz(params: {
   const {text: rawJson, modelUsed} = await appelerGeminiAvecSecours(prompt, {
     signal,
     onStatus,
+    timeoutMs: QUIZ_REQUEST_TIMEOUT_MS,
     generationConfig: {
       temperature: 0.35,
       responseMimeType: 'application/json',
@@ -564,6 +728,12 @@ export async function generateFolderQuiz(params: {
   return {questions: sanitized, modelUsed};
 }
 
+export interface DocumentExplanationContext {
+  documentIntro?: string;
+  contextBefore?: string;
+  contextAfter?: string;
+}
+
 export async function askGeminiSelectionExplain(params: {
   selectedText: string;
   courseContext: {
@@ -572,6 +742,7 @@ export async function askGeminiSelectionExplain(params: {
     subject: string;
     professor: string;
   };
+  documentContext?: DocumentExplanationContext;
   history: GeminiChatTurn[];
   followUpQuestion?: string;
   signal?: AbortSignal;
@@ -580,28 +751,64 @@ export async function askGeminiSelectionExplain(params: {
   const {
     selectedText,
     courseContext,
+    documentContext,
     history,
     followUpQuestion,
     signal,
     onStatus,
   } = params;
 
-  const systemText = [
-    `Tu es un assistant pédagogique universitaire rigoureux et synthétique qui répond en français.`,
-    `L'étudiant lit actuellement le cours suivant :`,
-    `- Titre : ${courseContext.displayTitle} (fichier : ${courseContext.fileName})`,
-    `- Matière : ${courseContext.subject}`,
-    `- Professeur / Dossier : ${courseContext.professor}`,
-    `Extrait sélectionné dans le document :`,
-    `« ${selectedText} »`,
-    `Consignes :`,
-    `- Donne des explications claires, structurées et concises adaptées au niveau universitaire de cette matière.`,
-    `- Utilise des paragraphes courts, des puces (-) et du gras (**mot**) pour mettre en valeur les notions clés.`,
-    `- Si l'extrait est un terme technique, donne sa définition précise, son mécanisme ou rôle, et un repère mnémotechnique ou exemple concret si pertinent.`,
-  ].join('\n');
+  const systemLines = [
+    `Tu es un assistant universitaire. Explique uniquement le terme ou passage sélectionné dans le cadre précis de la matière et de l'extrait de cours fournis ci-dessous. Ignore totalement les définitions grand public ou issues d'autres disciplines en cas d'homonymie.`,
+    ``,
+    `=== MÉTADONNÉES DU COURS ===`,
+    `- Matière : ${courseContext.subject || 'Non précisée'}`,
+    `- Professeur : ${courseContext.professor || 'Non précisé'}`,
+    `- Titre du fichier : ${courseContext.displayTitle} (${courseContext.fileName})`,
+  ];
+
+  if (documentContext?.documentIntro?.trim()) {
+    systemLines.push(
+      ``,
+      `=== THÈME GÉNÉRAL DU DOCUMENT (500 premiers caractères) ===`,
+      documentContext.documentIntro.trim()
+    );
+  }
+
+  const hasWindow =
+    Boolean(documentContext?.contextBefore?.trim()) ||
+    Boolean(documentContext?.contextAfter?.trim());
+
+  if (hasWindow) {
+    const before = documentContext?.contextBefore?.trim();
+    const after = documentContext?.contextAfter?.trim();
+    systemLines.push(
+      ``,
+      `=== EXTRAIT DE COURS AUTOUR DU PASSAGE SÉLECTIONNÉ ===`,
+      `${before ? `[…] ${before} ` : ''}<<< ${selectedText} >>>${after ? ` ${after} […]` : ''}`
+    );
+  } else {
+    systemLines.push(
+      ``,
+      `=== PASSAGE SÉLECTIONNÉ ===`,
+      `« ${selectedText} »`
+    );
+  }
+
+  systemLines.push(
+    ``,
+    `=== FORMAT DE RÉPONSE ATTENDU ===`,
+    `Donne une réponse courte, rigoureuse et strictement ancrée dans ce document de cours, structurée exactement en 3 points :`,
+    `- **Définition dans ce cours** : définition précise du terme ou concept dans le contexte de cette matière.`,
+    `- **Mécanisme / rôle clé** : fonctionnement, propriétés ou rôle essentiel décrit dans le cours.`,
+    `- **Lien avec le passage sélectionné** : explication concrète du sens et de la portée du passage sélectionné dans cet extrait.`,
+    `Pour toute question de suivi, reste strictement dans le cadre de ce même cours et de ce contexte.`
+  );
+
+  const systemText = systemLines.join('\n');
 
   const contents: Array<{role: 'user' | 'model'; parts: Array<{text: string}>}> = [];
-  const initialUserPrompt = `Explique clairement ce passage ou terme dans le contexte de mon cours de ${courseContext.subject} :\n\n« ${selectedText} »`;
+  const initialUserPrompt = `Explique le passage ou terme sélectionné « ${selectedText} » strictement dans le cadre de ce cours de ${courseContext.subject || 'cette matière'}.`;
 
   if (history.length === 0) {
     contents.push({
@@ -629,8 +836,9 @@ export async function askGeminiSelectionExplain(params: {
     },
     contents,
     generationConfig: {
-      temperature: 0.4,
+      temperature: 0.3,
     },
+    timeoutMs: EXPLAIN_REQUEST_TIMEOUT_MS,
     signal,
     onStatus,
   });

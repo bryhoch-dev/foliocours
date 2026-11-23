@@ -29,6 +29,7 @@ interface ReaderAssistantDrawerProps {
   drawerMode: AssistantDrawerMode;
   selectedText: string;
   // Explain (AI)
+  subject?: string;
   chatHistory: GeminiChatTurn[];
   isExplaining: boolean;
   explainStatus?: string | null;
@@ -179,6 +180,7 @@ export const ReaderAssistantDrawer: React.FC<ReaderAssistantDrawerProps> = ({
   isOpen,
   drawerMode,
   selectedText,
+  subject,
   chatHistory,
   isExplaining,
   explainStatus,
@@ -297,8 +299,15 @@ export const ReaderAssistantDrawer: React.FC<ReaderAssistantDrawerProps> = ({
               ) : (
                 <div
                   key={idx}
-                  className="rounded-lg border border-slate-800 bg-[#0B1120] p-3"
+                  className="rounded-lg border border-slate-800 bg-[#0B1120] p-3 space-y-2"
                 >
+                  {subject && (
+                    <div className="flex items-center pb-1.5 border-b border-slate-800/80">
+                      <span className="inline-flex items-center rounded border border-amber-500/25 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300/90 truncate max-w-full">
+                        Contexte : {subject}
+                      </span>
+                    </div>
+                  )}
                   <SafeAiFormattedText text={turn.text} />
                 </div>
               );

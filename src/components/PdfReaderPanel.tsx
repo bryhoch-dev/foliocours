@@ -42,6 +42,8 @@ import {
 } from '../services/fileFormats';
 import {
   getCachedCloudFile,
+  getIndexedPagesByDocPaths,
+  normaliserTexte,
   saveCachedCloudFile,
   searchCloudIndexPayload,
   searchIndexedLibrary,
@@ -69,6 +71,7 @@ import {
 import {
   askGeminiSelectionExplain,
   isGeminiMissingKeyError,
+  type DocumentExplanationContext,
 } from '../services/gemini';
 import {FileFormatBadge} from './FileFormatBadge';
 import {
@@ -701,6 +704,237 @@ function renderSafeMammothHtml(html: string): React.ReactNode {
   );
 }
 
+function extractOdtBlocksPlainText(blocks: OdtBlock[]): string {
+  const parts: string[] = [];
+  const visit = (block: OdtBlock) => {
+    if (block.type === 'heading' || block.type === 'paragraph') {
+      const t = block.spans.map((s) => s.text).join('').trim();
+      if (t) parts.push(t);
+    } else if (block.type === 'list') {
+      for (const item of block.items) {
+        for (const child of item) visit(child);
+      }
+    } else if (block.type === 'table') {
+      for (const row of block.rows) {
+        for (const cell of row) {
+          for (const child of cell) visit(child);
+        }
+      }
+    }
+  };
+  for (const b of blocks) visit(b);
+  return parts.join('\n').trim();
+}
+
+async function extractSinglePdfPageText(
+  pdf: PDFDocumentProxy,
+  pageNum: number
+): Promise<string> {
+  try {
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+    page.cleanup();
+    const parts: string[] = [];
+    for (const item of content.items) {
+      if ('str' in item && typeof item.str === 'string') {
+        parts.push(item.str);
+      }
+    }
+    return parts.join(' ').replace(/\s+/g, ' ').trim();
+  } catch {
+    return '';
+  }
+}
+
+function findSelectionInCleanSlice(
+  haystack: string,
+  selection: string
+): {index: number; length: number} | null {
+  const cleanSel = selection.replace(/\s+/g, ' ').trim();
+  if (!haystack || !cleanSel) return null;
+
+  const exactIdx = haystack.indexOf(cleanSel);
+  if (exactIdx !== -1) {
+    return {index: exactIdx, length: cleanSel.length};
+  }
+
+  const lowerHaystack = haystack.toLowerCase();
+  const lowerSel = cleanSel.toLowerCase();
+  const lowerIdx = lowerHaystack.indexOf(lowerSel);
+  if (lowerIdx !== -1) {
+    return {index: lowerIdx, length: cleanSel.length};
+  }
+
+  const dehyphenated = cleanSel.replace(/-\s+/g, '');
+  if (dehyphenated !== cleanSel) {
+    const dehyIdx = lowerHaystack.indexOf(dehyphenated.toLowerCase());
+    if (dehyIdx !== -1) {
+      return {index: dehyIdx, length: dehyphenated.length};
+    }
+  }
+
+  const normHaystack = normaliserTexte(haystack);
+  const normSel = normaliserTexte(dehyphenated);
+  const normIdx = normHaystack.indexOf(normSel);
+  if (normIdx !== -1) {
+    return {index: normIdx, length: normSel.length};
+  }
+
+  const words = normSel.split(/\s+/).filter((w) => w.length >= 2);
+  if (words.length >= 4) {
+    const anchor = words.slice(0, 4).join(' ');
+    const anchorIdx = normHaystack.indexOf(anchor);
+    if (anchorIdx !== -1) {
+      return {index: anchorIdx, length: anchor.length};
+    }
+  }
+
+  return null;
+}
+
+function buildContextSliceFromPages(
+  pages: Array<{pageNumber: number; text: string}>,
+  selectedText: string,
+  hintPageNumber?: number,
+  domFallbackText?: string
+): DocumentExplanationContext {
+  const cleanPages: Array<{pageNumber: number; text: string}> = [];
+  for (const p of pages) {
+    const cleaned = p.text.replace(/\s+/g, ' ').trim();
+    if (cleaned) {
+      cleanPages.push({pageNumber: p.pageNumber, text: cleaned});
+    }
+  }
+
+  if (cleanPages.length === 0) {
+    const fallbackClean = (domFallbackText ?? '').replace(/\s+/g, ' ').trim();
+    if (!fallbackClean) return {};
+    const match = findSelectionInCleanSlice(fallbackClean, selectedText);
+    if (match) {
+      return {
+        documentIntro: fallbackClean.slice(0, 500).trim(),
+        contextBefore: fallbackClean
+          .slice(Math.max(0, match.index - 1500), match.index)
+          .trim(),
+        contextAfter: fallbackClean
+          .slice(match.index + match.length, match.index + match.length + 1500)
+          .trim(),
+      };
+    }
+    return {
+      documentIntro: fallbackClean.slice(0, 500).trim(),
+      contextBefore: fallbackClean.slice(0, 1500).trim(),
+    };
+  }
+
+  const pageOffsets: Array<{
+    pageNumber: number;
+    start: number;
+    end: number;
+  }> = [];
+  const chunks: string[] = [];
+  let cursor = 0;
+
+  for (const p of cleanPages) {
+    if (cursor > 0) {
+      chunks.push(' ');
+      cursor += 1;
+    }
+    const start = cursor;
+    chunks.push(p.text);
+    cursor += p.text.length;
+    pageOffsets.push({pageNumber: p.pageNumber, start, end: cursor});
+  }
+
+  const fullText = chunks.join('');
+  const documentIntro = fullText.slice(0, 500).trim();
+
+  let globalMatchIndex = -1;
+  let globalMatchLength = selectedText.trim().length;
+
+  // Prefer finding the selection around the page where the user actually highlighted it
+  if (hintPageNumber !== undefined) {
+    const targetOffset = pageOffsets.find((o) => o.pageNumber === hintPageNumber);
+    if (targetOffset) {
+      const winStart = Math.max(0, targetOffset.start - 400);
+      const winEnd = Math.min(fullText.length, targetOffset.end + 400);
+      const localMatch = findSelectionInCleanSlice(
+        fullText.slice(winStart, winEnd),
+        selectedText
+      );
+      if (localMatch) {
+        globalMatchIndex = winStart + localMatch.index;
+        globalMatchLength = localMatch.length;
+      }
+    }
+  }
+
+  if (globalMatchIndex === -1) {
+    const globalMatch = findSelectionInCleanSlice(fullText, selectedText);
+    if (globalMatch) {
+      globalMatchIndex = globalMatch.index;
+      globalMatchLength = globalMatch.length;
+    }
+  }
+
+  if (globalMatchIndex !== -1) {
+    return {
+      documentIntro,
+      contextBefore: fullText
+        .slice(Math.max(0, globalMatchIndex - 1500), globalMatchIndex)
+        .trim(),
+      contextAfter: fullText
+        .slice(
+          globalMatchIndex + globalMatchLength,
+          globalMatchIndex + globalMatchLength + 1500
+        )
+        .trim(),
+    };
+  }
+
+  // Fallback if exact match wasn't found: provide text around hinted page or DOM page
+  if (hintPageNumber !== undefined) {
+    const targetOffset = pageOffsets.find((o) => o.pageNumber === hintPageNumber);
+    if (targetOffset) {
+      return {
+        documentIntro,
+        contextBefore: fullText
+          .slice(
+            Math.max(0, targetOffset.start - 500),
+            Math.min(fullText.length, targetOffset.end + 500)
+          )
+          .slice(0, 3000)
+          .trim(),
+      };
+    }
+  }
+
+  const domClean = (domFallbackText ?? '').replace(/\s+/g, ' ').trim();
+  if (domClean) {
+    const domMatch = findSelectionInCleanSlice(domClean, selectedText);
+    if (domMatch) {
+      return {
+        documentIntro,
+        contextBefore: domClean
+          .slice(Math.max(0, domMatch.index - 1500), domMatch.index)
+          .trim(),
+        contextAfter: domClean
+          .slice(domMatch.index + domMatch.length, domMatch.index + domMatch.length + 1500)
+          .trim(),
+      };
+    }
+    return {
+      documentIntro,
+      contextBefore: domClean.slice(0, 2000).trim(),
+    };
+  }
+
+  return {
+    documentIntro,
+    contextBefore: fullText.slice(0, 2000).trim(),
+  };
+}
+
 export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   document: courseDoc,
   mode = 'local',
@@ -783,12 +1017,17 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     left: number;
     top: number;
     placement: 'above' | 'below';
+    hintPageNumber?: number;
+    domFallbackText?: string;
   } | null>(null);
   const selectionDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerMode, setDrawerMode] = useState<AssistantDrawerMode>('explain');
   const [drawerSelection, setDrawerSelection] = useState('');
+  const [drawerDocContext, setDrawerDocContext] = useState<
+    DocumentExplanationContext | undefined
+  >(undefined);
   const [chatHistory, setChatHistory] = useState<GeminiChatTurn[]>([]);
   const [isExplaining, setIsExplaining] = useState(false);
   const [explainStatus, setExplainStatus] = useState<string | null>(null);
@@ -796,6 +1035,10 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   const [explainError, setExplainError] = useState<string | null>(null);
   const [isMissingApiKey, setIsMissingApiKey] = useState(false);
   const explainAbortRef = useRef<AbortController | null>(null);
+  const lastSelectionHintsRef = useRef<{
+    hintPageNumber?: number;
+    domFallbackText?: string;
+  }>({});
 
   const [drawerSearchResults, setDrawerSearchResults] = useState<SearchResult[]>([]);
   const [isDrawerSearching, setIsDrawerSearching] = useState(false);
@@ -1798,6 +2041,9 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     explainAbortRef.current?.abort();
     explainAbortRef.current = null;
     setIsExplaining(false);
+    setDrawerDocContext(undefined);
+    setExplainStatus(null);
+    setExplainModelUsed(null);
   }, [courseDoc]);
 
   useEffect(() => {
@@ -1841,6 +2087,22 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       return;
     }
 
+    const anchorEl =
+      anchorNode instanceof Element ? anchorNode : anchorNode.parentElement;
+    const pageEl = anchorEl?.closest('[data-page]');
+    let hintPageNumber: number | undefined;
+    let domFallbackText: string | undefined;
+
+    if (pageEl) {
+      const parsed = parseInt(pageEl.getAttribute('data-page') || '', 10);
+      if (!Number.isNaN(parsed) && parsed > 0) {
+        hintPageNumber = parsed;
+      }
+      domFallbackText = pageEl.textContent?.replace(/\s+/g, ' ').trim();
+    } else if (container.innerText) {
+      domFallbackText = container.innerText.replace(/\s+/g, ' ').trim();
+    }
+
     const viewportW = window.innerWidth;
     const viewportH = window.innerHeight;
     const halfMenuW = Math.min(165, Math.floor((viewportW - 24) / 2));
@@ -1859,6 +2121,8 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       left: Math.round(clampedLeft),
       top: Math.round(clampedTop),
       placement: placeBelow ? 'below' : 'above',
+      hintPageNumber,
+      domFallbackText,
     });
   }, []);
 
@@ -1929,11 +2193,121 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     [mode, cloudIndex, allDocuments]
   );
 
+  const resolveDocumentContextForSelection = useCallback(
+    async (
+      snippet: string,
+      hintPageNumber?: number,
+      domFallbackText?: string
+    ): Promise<DocumentExplanationContext> => {
+      if (!courseDoc) return {};
+
+      let pages: Array<{pageNumber: number; text: string}> = [];
+
+      // 1. Check indexed text first (IndexedDB for local, search_index.json for cloud)
+      try {
+        if (mode === 'local') {
+          const indexedMap = await getIndexedPagesByDocPaths([
+            courseDoc.relativePath,
+          ]);
+          pages = indexedMap.get(courseDoc.relativePath) ?? [];
+        } else if (cloudIndex) {
+          const cloudDoc = cloudIndex.documents.find(
+            (d) => d.relativePath === courseDoc.relativePath
+          );
+          if (cloudDoc && cloudDoc.pages.length > 0) {
+            pages = cloudDoc.pages
+              .slice()
+              .sort((a, b) => a.p - b.p)
+              .map((p) => ({pageNumber: p.p, text: p.t}));
+          }
+        }
+      } catch {
+        // fall through to in-memory reader extraction
+      }
+
+      // 2. Fallback to already-loaded document content in the reader
+      if (pages.length === 0) {
+        if (docFormat === 'docx') {
+          let docxPlain = docxFallbackText?.trim() ?? '';
+          if (!docxPlain && docxContainerRef.current) {
+            docxPlain = (
+              docxContainerRef.current.innerText ||
+              docxContainerRef.current.textContent ||
+              ''
+            ).trim();
+          }
+          if (!docxPlain && docxFallbackHtml && typeof DOMParser !== 'undefined') {
+            docxPlain = (
+              new DOMParser().parseFromString(docxFallbackHtml, 'text/html').body
+                .textContent ?? ''
+            ).trim();
+          }
+          if (docxPlain) {
+            pages = [{pageNumber: 1, text: docxPlain}];
+          }
+        } else if (docFormat === 'odt' && odtDoc) {
+          const odtPlain = extractOdtBlocksPlainText(odtDoc.blocks);
+          if (odtPlain) {
+            pages = [{pageNumber: 1, text: odtPlain}];
+          }
+        } else if (docFormat === 'pdf' && pdfInstanceRef.current) {
+          const pdf = pdfInstanceRef.current;
+          const total = pdf.numPages;
+          const targetPageNum = Math.max(
+            1,
+            Math.min(total, hintPageNumber ?? currentPage)
+          );
+
+          const pageNumsToRead = new Set<number>([1]);
+          if (total <= 25) {
+            for (let p = 1; p <= total; p++) pageNumsToRead.add(p);
+          } else {
+            const start = Math.max(1, targetPageNum - 3);
+            const end = Math.min(total, targetPageNum + 3);
+            for (let p = start; p <= end; p++) pageNumsToRead.add(p);
+          }
+
+          const sortedNums = Array.from(pageNumsToRead).sort((a, b) => a - b);
+          const extracted: Array<{pageNumber: number; text: string}> = [];
+          for (const pNum of sortedNums) {
+            const txt = await extractSinglePdfPageText(pdf, pNum);
+            if (txt) {
+              extracted.push({pageNumber: pNum, text: txt});
+            }
+          }
+          pages = extracted;
+        }
+      }
+
+      return buildContextSliceFromPages(
+        pages,
+        snippet,
+        hintPageNumber ?? (docFormat === 'pdf' ? currentPage : undefined),
+        domFallbackText
+      );
+    },
+    [
+      courseDoc,
+      mode,
+      cloudIndex,
+      docFormat,
+      docxFallbackText,
+      docxFallbackHtml,
+      odtDoc,
+      currentPage,
+    ]
+  );
+
   const runExplainForSelection = useCallback(
     async (
       snippet: string,
       priorHistory: GeminiChatTurn[],
-      followUp?: string
+      followUp?: string,
+      selectionHints?: {
+        hintPageNumber?: number;
+        domFallbackText?: string;
+        docContextOverride?: DocumentExplanationContext;
+      }
     ) => {
       if (!courseDoc) return;
       explainAbortRef.current?.abort();
@@ -1963,6 +2337,20 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       setIsMissingApiKey(false);
 
       try {
+        let resolvedDocContext =
+          selectionHints?.docContextOverride ??
+          (priorHistory.length > 0 ? drawerDocContext : undefined);
+
+        if (!resolvedDocContext) {
+          resolvedDocContext = await resolveDocumentContextForSelection(
+            snippet,
+            selectionHints?.hintPageNumber,
+            selectionHints?.domFallbackText
+          );
+          if (controller.signal.aborted) return;
+          setDrawerDocContext(resolvedDocContext);
+        }
+
         const {text: answer, modelUsed} = await askGeminiSelectionExplain({
           selectedText: snippet,
           courseContext: {
@@ -1971,6 +2359,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
             subject: courseDoc.subject,
             professor: courseDoc.professor,
           },
+          documentContext: resolvedDocContext,
           history: priorHistory,
           followUpQuestion: followUp,
           signal: controller.signal,
@@ -1996,24 +2385,40 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
         }
       }
     },
-    [courseDoc, titleFormat, rules]
+    [
+      courseDoc,
+      titleFormat,
+      rules,
+      drawerDocContext,
+      resolveDocumentContextForSelection,
+    ]
   );
 
   const handleActionExplainSelection = () => {
     if (!selectionMenu) return;
-    const text = selectionMenu.text;
+    const {text, hintPageNumber, domFallbackText} = selectionMenu;
+    lastSelectionHintsRef.current = {hintPageNumber, domFallbackText};
     setSelectionMenu(null);
     setDrawerSelection(text);
+    setDrawerDocContext(undefined);
     setDrawerMode('explain');
     setDrawerOpen(true);
-    void runExplainForSelection(text, []);
+    void runExplainForSelection(text, [], undefined, {
+      hintPageNumber,
+      domFallbackText,
+    });
   };
 
   const handleActionSearchSelection = () => {
     if (!selectionMenu) return;
-    const text = selectionMenu.text;
+    const {text, hintPageNumber, domFallbackText} = selectionMenu;
+    lastSelectionHintsRef.current = {hintPageNumber, domFallbackText};
     setSelectionMenu(null);
     setDrawerSelection(text);
+    setDrawerDocContext(undefined);
+    setChatHistory([]);
+    setExplainError(null);
+    setExplainModelUsed(null);
     setDrawerMode('search');
     setDrawerOpen(true);
     void runSearchForSelection(text);
@@ -2030,7 +2435,12 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       !isExplaining &&
       !explainError
     ) {
-      void runExplainForSelection(drawerSelection, []);
+      void runExplainForSelection(
+        drawerSelection,
+        [],
+        undefined,
+        lastSelectionHintsRef.current
+      );
     }
   };
 
@@ -2386,6 +2796,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
           isOpen={drawerOpen}
           drawerMode={drawerMode}
           selectedText={drawerSelection}
+          subject={courseDoc.subject}
           chatHistory={chatHistory}
           isExplaining={isExplaining}
           explainStatus={explainStatus}
