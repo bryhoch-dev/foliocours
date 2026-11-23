@@ -2,6 +2,7 @@ import React, {useEffect, useMemo, useState} from 'react';
 import {
   ArrowLeft,
   BookOpen,
+  Check,
   ChevronRight,
   Cloud,
   CloudUpload,
@@ -28,8 +29,8 @@ import {
   formatCourseDisplayTitle,
 } from '../services/parser';
 import {
-  buildAccentInsensitiveRegex,
   clearAllOfflineCloudCache,
+  findHighlightRanges,
   searchCloudIndexPayload,
   searchIndexedLibrary,
 } from '../services/db';
@@ -83,23 +84,22 @@ function formatBytes(bytes: number): string {
 }
 
 function HighlightedSnippet({text, query}: {text: string; query: string}) {
-  const regex = buildAccentInsensitiveRegex(query);
-  if (!regex) return <>{text}</>;
-  const globalRegex = new RegExp(regex.source, 'gi');
+  const ranges = findHighlightRanges(text, query);
+  if (ranges.length === 0) return <>{text}</>;
+
   const parts: React.ReactNode[] = [];
   let lastIndex = 0;
-  let match: RegExpExecArray | null;
   let key = 0;
 
-  while ((match = globalRegex.exec(text)) !== null) {
-    if (match.index > lastIndex) parts.push(text.slice(lastIndex, match.index));
+  for (const range of ranges) {
+    if (range.start < lastIndex) continue;
+    if (range.start > lastIndex) parts.push(text.slice(lastIndex, range.start));
     parts.push(
       <mark key={key++} className="search-highlight">
-        {match[0]}
+        {text.slice(range.start, range.end)}
       </mark>
     );
-    lastIndex = match.index + match[0].length;
-    if (match[0].length === 0) break;
+    lastIndex = range.end;
   }
   if (lastIndex < text.length) parts.push(text.slice(lastIndex));
   return <>{parts}</>;
@@ -145,6 +145,7 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
 
   // Mobile search state
   const [searchQuery, setSearchQuery] = useState('');
+  const [wholeWordOnly, setWholeWordOnly] = useState(false);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
 
@@ -175,8 +176,10 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
       try {
         const hits =
           mode === 'cloud'
-            ? searchCloudIndexPayload(cloudIndex, trimmed, documents, 60)
-            : await searchIndexedLibrary(trimmed, 60);
+            ? searchCloudIndexPayload(cloudIndex, trimmed, documents, 60, {
+                wholeWordOnly,
+              })
+            : await searchIndexedLibrary(trimmed, 60, {wholeWordOnly});
         if (!cancelled) setSearchResults(hits);
       } finally {
         if (!cancelled) setIsSearching(false);
@@ -187,7 +190,7 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [mobileTab, searchQuery, mode, cloudIndex, documents]);
+  }, [mobileTab, searchQuery, wholeWordOnly, mode, cloudIndex, documents]);
 
   const currentSubjectGroup = useMemo(
     () => tree.find((s) => s.name === selectedSubject) ?? null,
@@ -600,15 +603,39 @@ export const MobileWorkspace: React.FC<MobileWorkspaceProps> = ({
         {mobileTab === 'search' && (
           <div className="flex flex-col">
             <div className="p-3.5 border-b border-slate-800/80 bg-[#0F172A]/60 space-y-2">
-              <div className="relative">
-                <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
-                <input
-                  type="search"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Mot-clé dans vos PDF, Word et ODT…"
-                  className="w-full min-h-[44px] rounded-xl border border-slate-800 bg-[#0B1120] pl-9 pr-3 text-sm text-slate-100 placeholder:text-slate-500 focus:border-amber-500/60 focus:outline-none"
-                />
+              <div className="flex items-center gap-2">
+                <div className="relative flex-1 min-w-0">
+                  <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="search"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="Mot-clé dans vos PDF, Word et ODT…"
+                    className="w-full min-h-[44px] rounded-xl border border-slate-800 bg-[#0B1120] pl-9 pr-3 text-sm text-slate-100 placeholder:text-slate-500 focus:border-amber-500/60 focus:outline-none"
+                  />
+                </div>
+                <button
+                  type="button"
+                  role="checkbox"
+                  aria-checked={wholeWordOnly}
+                  onClick={() => setWholeWordOnly((v) => !v)}
+                  className={`min-h-[44px] inline-flex items-center gap-1.5 rounded-xl border px-3 text-xs font-medium transition-colors cursor-pointer shrink-0 ${
+                    wholeWordOnly
+                      ? 'border-amber-500/60 bg-amber-500/15 text-amber-300'
+                      : 'border-slate-800 bg-[#0B1120] text-slate-300'
+                  }`}
+                >
+                  <span
+                    className={`w-3.5 h-3.5 rounded-xs border flex items-center justify-center ${
+                      wholeWordOnly
+                        ? 'border-amber-400 bg-amber-500 text-slate-950'
+                        : 'border-slate-600 bg-slate-900'
+                    }`}
+                  >
+                    {wholeWordOnly && <Check className="w-2.5 h-2.5 stroke-[3]" />}
+                  </span>
+                  <span>Mot entier</span>
+                </button>
               </div>
               <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono tabular-nums">
                 <span>

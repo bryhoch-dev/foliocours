@@ -152,6 +152,7 @@ export default function App() {
   // Search State
   const [isSearchModalOpen, setIsSearchModalOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [searchWholeWordOnly, setSearchWholeWordOnly] = useState(false);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
 
@@ -353,8 +354,12 @@ export default function App() {
       try {
         const hits =
           mode === 'cloud'
-            ? searchCloudIndexPayload(cloudIndex, trimmed, cloudDocuments, 80)
-            : await searchIndexedLibrary(trimmed, 80);
+            ? searchCloudIndexPayload(cloudIndex, trimmed, cloudDocuments, 80, {
+                wholeWordOnly: searchWholeWordOnly,
+              })
+            : await searchIndexedLibrary(trimmed, 80, {
+                wholeWordOnly: searchWholeWordOnly,
+              });
         if (!cancelled) setSearchResults(hits);
       } finally {
         if (!cancelled) setIsSearching(false);
@@ -365,7 +370,7 @@ export default function App() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [activeTab, searchQuery, mode, cloudIndex, cloudDocuments]);
+  }, [activeTab, searchQuery, searchWholeWordOnly, mode, cloudIndex, cloudDocuments]);
 
   const handleConnectOrRefreshCloud = useCallback(
     async (options?: {silentAuto?: boolean}) => {
@@ -1067,6 +1072,7 @@ export default function App() {
           importQueue={importQueue}
           isWritingImport={isWritingImport}
           searchQuery={searchQuery}
+          wholeWordOnly={searchWholeWordOnly}
           searchResults={searchResults}
           isSearching={isSearching}
           titleFormat={titleFormat}
@@ -1083,6 +1089,7 @@ export default function App() {
             setImportQueue((prev) => prev.filter((item) => item.id !== id))
           }
           onSearchQueryChange={setSearchQuery}
+          onWholeWordOnlyChange={setSearchWholeWordOnly}
           onOpenRules={() => setIsRulesModalOpen(true)}
           onOpenFlattenModal={() => setIsFlattenModalOpen(true)}
         />
@@ -1145,6 +1152,8 @@ export default function App() {
         mode={mode}
         cloudIndex={cloudIndex}
         initialQuery={searchQuery}
+        wholeWordOnly={searchWholeWordOnly}
+        onWholeWordOnlyChange={setSearchWholeWordOnly}
         documents={activeDocuments}
         titleFormat={titleFormat}
         onClose={() => setIsSearchModalOpen(false)}

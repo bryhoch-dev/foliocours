@@ -1,5 +1,5 @@
 import React, {useEffect, useRef, useState} from 'react';
-import {CornerDownLeft, PanelLeft, Search, X} from 'lucide-react';
+import {Check, CornerDownLeft, PanelLeft, Search, X} from 'lucide-react';
 import type {
   AppMode,
   CloudSearchIndexPayload,
@@ -12,7 +12,7 @@ import {
   formatCourseDisplayTitle,
 } from '../services/parser';
 import {
-  buildAccentInsensitiveRegex,
+  findHighlightRanges,
   searchCloudIndexPayload,
   searchIndexedLibrary,
 } from '../services/db';
@@ -23,6 +23,8 @@ interface GlobalSearchModalProps {
   mode: AppMode;
   cloudIndex: CloudSearchIndexPayload | null;
   initialQuery: string;
+  wholeWordOnly?: boolean;
+  onWholeWordOnlyChange?: (value: boolean) => void;
   documents: CourseDocument[];
   titleFormat?: TitleFormatSettings;
   onClose: () => void;
@@ -31,26 +33,24 @@ interface GlobalSearchModalProps {
 }
 
 function HighlightSnippet({text, query}: {text: string; query: string}) {
-  const regex = buildAccentInsensitiveRegex(query);
-  if (!regex) return <>{text}</>;
+  const ranges = findHighlightRanges(text, query);
+  if (ranges.length === 0) return <>{text}</>;
 
-  const globalRegex = new RegExp(regex.source, 'gi');
   const parts: React.ReactNode[] = [];
   let lastIndex = 0;
-  let match: RegExpExecArray | null;
   let key = 0;
 
-  while ((match = globalRegex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push(text.slice(lastIndex, match.index));
+  for (const range of ranges) {
+    if (range.start < lastIndex) continue;
+    if (range.start > lastIndex) {
+      parts.push(text.slice(lastIndex, range.start));
     }
     parts.push(
       <mark key={key++} className="search-highlight">
-        {match[0]}
+        {text.slice(range.start, range.end)}
       </mark>
     );
-    lastIndex = match.index + match[0].length;
-    if (match[0].length === 0) break;
+    lastIndex = range.end;
   }
   if (lastIndex < text.length) {
     parts.push(text.slice(lastIndex));
@@ -63,6 +63,8 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
   mode,
   cloudIndex,
   initialQuery,
+  wholeWordOnly: controlledWholeWordOnly,
+  onWholeWordOnlyChange,
   documents,
   titleFormat = DEFAULT_TITLE_FORMAT_SETTINGS,
   onClose,
@@ -70,17 +72,34 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
   onPinResultsToPanel,
 }) => {
   const [query, setQuery] = useState(initialQuery);
+  const [internalWholeWordOnly, setInternalWholeWordOnly] = useState(
+    controlledWholeWordOnly ?? false
+  );
   const [results, setResults] = useState<SearchResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  const wholeWordOnly =
+    controlledWholeWordOnly !== undefined
+      ? controlledWholeWordOnly
+      : internalWholeWordOnly;
+
+  const toggleWholeWordOnly = () => {
+    const next = !wholeWordOnly;
+    setInternalWholeWordOnly(next);
+    onWholeWordOnlyChange?.(next);
+  };
+
   useEffect(() => {
     if (isOpen) {
       setQuery(initialQuery);
+      if (controlledWholeWordOnly !== undefined) {
+        setInternalWholeWordOnly(controlledWholeWordOnly);
+      }
       setTimeout(() => inputRef.current?.focus(), 20);
     }
-  }, [isOpen, initialQuery]);
+  }, [isOpen, initialQuery, controlledWholeWordOnly]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -97,8 +116,10 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
       try {
         const hits =
           mode === 'cloud'
-            ? searchCloudIndexPayload(cloudIndex, trimmed, documents, 60)
-            : await searchIndexedLibrary(trimmed, 60);
+            ? searchCloudIndexPayload(cloudIndex, trimmed, documents, 60, {
+                wholeWordOnly,
+              })
+            : await searchIndexedLibrary(trimmed, 60, {wholeWordOnly});
         if (!cancelled) {
           setResults(hits);
           setSelectedIndex(0);
@@ -114,7 +135,7 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [query, isOpen, mode, cloudIndex, documents]);
+  }, [query, wholeWordOnly, isOpen, mode, cloudIndex, documents]);
 
   if (!isOpen) return null;
 
@@ -152,7 +173,7 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
         onClick={(e) => e.stopPropagation()}
         onKeyDown={handleKeyDown}
       >
-        <div className="flex items-center gap-3 border-b border-slate-800 px-4 py-3">
+        <div className="flex items-center gap-2.5 border-b border-slate-800 px-4 py-3">
           <Search className="w-4 h-4 text-amber-400 shrink-0" />
           <input
             ref={inputRef}
@@ -164,8 +185,31 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
                 ? 'Rechercher dans le cache search_index.json…'
                 : 'Rechercher dans les PDF, Word (.docx) et ODT…'
             }
-            className="flex-1 bg-transparent text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none"
+            className="flex-1 min-w-0 bg-transparent text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none"
           />
+          <button
+            type="button"
+            role="checkbox"
+            aria-checked={wholeWordOnly}
+            onClick={toggleWholeWordOnly}
+            title="Masquer les correspondances partielles à l’intérieur d’un mot"
+            className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer shrink-0 ${
+              wholeWordOnly
+                ? 'border-amber-500/60 bg-amber-500/15 text-amber-300'
+                : 'border-slate-700 bg-slate-800/70 text-slate-300 hover:border-slate-600 hover:text-slate-100'
+            }`}
+          >
+            <span
+              className={`w-3.5 h-3.5 rounded-xs border flex items-center justify-center ${
+                wholeWordOnly
+                  ? 'border-amber-400 bg-amber-500 text-slate-950'
+                  : 'border-slate-600 bg-slate-900'
+              }`}
+            >
+              {wholeWordOnly && <Check className="w-2.5 h-2.5 stroke-[3]" />}
+            </span>
+            <span>Mot entier</span>
+          </button>
           {results.length > 0 && (
             <button
               type="button"
@@ -183,7 +227,7 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
             type="button"
             onClick={onClose}
             aria-label="Fermer la recherche"
-            className="rounded-md p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer"
+            className="rounded-md p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer shrink-0"
           >
             <X className="w-4 h-4" />
           </button>

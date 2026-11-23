@@ -380,6 +380,107 @@ export async function exportSearchIndexForCloud(): Promise<CloudSearchIndexPaylo
   };
 }
 
+export function normaliserTexte(str: string): string {
+  return str
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+interface QuerySearchMatchers {
+  qNorm: string;
+  regexMotExact: RegExp;
+  regexDebutMot: RegExp;
+  regexPartiel: RegExp;
+}
+
+function buildQuerySearchMatchers(rawQuery: string): QuerySearchMatchers | null {
+  const qNorm = normaliserTexte(rawQuery).replace(/\s+/g, ' ').trim();
+  if (!qNorm) return null;
+
+  const qPattern = escapeRegExp(qNorm).replace(/ /g, '\\s+');
+  const startsWithWord = /^\w/.test(qNorm);
+  const endsWithWord = /\w$/.test(qNorm);
+
+  const startBoundary = startsWithWord ? '\\b' : '';
+  const exactEndBoundary = endsWithWord ? '(s|es|x)?\\b' : '';
+
+  try {
+    return {
+      qNorm,
+      regexMotExact: new RegExp(`${startBoundary}${qPattern}${exactEndBoundary}`, 'g'),
+      regexDebutMot: new RegExp(`${startBoundary}${qPattern}`, 'g'),
+      regexPartiel: new RegExp(qPattern, 'g'),
+    };
+  } catch {
+    return null;
+  }
+}
+
+interface NormalizedTextMap {
+  normalized: string;
+  rawStart: number[];
+  rawEnd: number[];
+}
+
+function buildNormalizedTextMap(rawText: string): NormalizedTextMap {
+  let normalized = '';
+  const rawStart: number[] = [];
+  const rawEnd: number[] = [];
+
+  let i = 0;
+  while (i < rawText.length) {
+    const code = rawText.charCodeAt(i);
+    const step =
+      code >= 0xd800 && code <= 0xdbff && i + 1 < rawText.length ? 2 : 1;
+    const rawChar = rawText.slice(i, i + step);
+    const normPart = rawChar
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+
+    if (normPart.length === 0) {
+      if (rawEnd.length > 0) {
+        rawEnd[rawEnd.length - 1] = i + step;
+      }
+    } else {
+      for (let k = 0; k < normPart.length; k++) {
+        normalized += normPart[k];
+        rawStart.push(i);
+        rawEnd.push(i + step);
+      }
+    }
+    i += step;
+  }
+
+  return {normalized, rawStart, rawEnd};
+}
+
+function collectRegexMatches(regex: RegExp, text: string): Array<{index: number; length: number}> {
+  const re = new RegExp(regex.source, 'g');
+  const matches: Array<{index: number; length: number}> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m[0].length === 0) break;
+    matches.push({index: m.index, length: m[0].length});
+  }
+  return matches;
+}
+
+function findFirstRegexMatch(
+  regex: RegExp,
+  text: string
+): {index: number; length: number} | null {
+  const re = new RegExp(regex.source, 'g');
+  const m = re.exec(text);
+  if (!m || m[0].length === 0) return null;
+  return {index: m.index, length: m[0].length};
+}
+
 const DIACRITIC_MAP: Record<string, string> = {
   a: '[aàâäáã]',
   e: '[eéèêë]',
@@ -395,10 +496,7 @@ export function buildAccentInsensitiveRegex(rawQuery: string): RegExp | null {
   const trimmed = rawQuery.trim();
   if (!trimmed) return null;
 
-  const normalized = trimmed
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase();
+  const normalized = normaliserTexte(trimmed);
 
   let pattern = '';
   for (const ch of normalized) {
@@ -418,6 +516,41 @@ export function buildAccentInsensitiveRegex(rawQuery: string): RegExp | null {
   }
 }
 
+/**
+ * Returns raw character ranges in `text` to highlight, prioritizing exact whole words
+ * first, then word-prefix matches, then partial matches so snippets highlight the right word.
+ */
+export function findHighlightRanges(
+  text: string,
+  query: string
+): Array<{start: number; end: number}> {
+  const matchers = buildQuerySearchMatchers(query);
+  if (!matchers || !text) return [];
+
+  const {normalized, rawStart, rawEnd} = buildNormalizedTextMap(text);
+  if (!normalized) return [];
+
+  let chosen = collectRegexMatches(matchers.regexMotExact, normalized);
+  if (chosen.length === 0) {
+    chosen = collectRegexMatches(matchers.regexDebutMot, normalized);
+  }
+  if (chosen.length === 0) {
+    chosen = collectRegexMatches(matchers.regexPartiel, normalized);
+  }
+
+  const ranges: Array<{start: number; end: number}> = [];
+  for (const hit of chosen) {
+    const endNormIdx = hit.index + hit.length - 1;
+    if (hit.index < rawStart.length && endNormIdx < rawEnd.length) {
+      ranges.push({
+        start: rawStart[hit.index],
+        end: rawEnd[endNormIdx],
+      });
+    }
+  }
+  return ranges;
+}
+
 function extractSnippet(text: string, matchIndex: number, matchLength: number): string {
   const radius = 85;
   const start = Math.max(0, matchIndex - radius);
@@ -428,62 +561,195 @@ function extractSnippet(text: string, matchIndex: number, matchLength: number): 
   return slice;
 }
 
-/**
- * Streaming cursor-based search across local IndexedDB.
- * Keeps RAM footprint O(1) per page regardless of total PDF corpus size.
- */
-export async function searchIndexedLibrary(
-  query: string,
-  maxResults = 80
-): Promise<SearchResult[]> {
-  const regex = buildAccentInsensitiveRegex(query);
-  if (!regex) return [];
+interface EvaluatedPageMatch {
+  score: number;
+  matchLevel: 2 | 3 | 4;
+  exactCount: number;
+  snippet: string;
+}
 
-  const db = await openDatabase();
-  const docsMap = await getAllIndexedDocuments();
-  const results: SearchResult[] = [];
+function evaluateTitleMatch(
+  doc: {name: string; subject: string; professor: string},
+  matchers: QuerySearchMatchers
+): {score: number; matchLevel: 1 | 3 | 4} | null {
+  const titleNormalized = normaliserTexte(
+    `${doc.name} ${doc.subject} ${doc.professor}`
+  ).replace(/[_-]+/g, ' ');
 
-  for (const doc of docsMap.values()) {
-    const composite = `${doc.name} ${doc.subject} ${doc.professor}`;
-    if (regex.test(composite)) {
-      results.push({
-        docPath: doc.relativePath,
-        fileName: doc.name,
-        subject: doc.subject,
-        professor: doc.professor,
-        pageNumber: 1,
-        snippet: `Correspondance dans le nom ou classement (${doc.subject} / ${doc.professor})`,
-        matchType: 'filename',
-      });
-      if (results.length >= maxResults) return results;
+  if (findFirstRegexMatch(matchers.regexMotExact, titleNormalized)) {
+    return {score: 1000, matchLevel: 1};
+  }
+  if (findFirstRegexMatch(matchers.regexDebutMot, titleNormalized)) {
+    return {score: 100, matchLevel: 3};
+  }
+  if (
+    titleNormalized.includes(matchers.qNorm) ||
+    findFirstRegexMatch(matchers.regexPartiel, titleNormalized)
+  ) {
+    return {score: 1, matchLevel: 4};
+  }
+  return null;
+}
+
+function evaluatePageTextMatch(
+  rawText: string,
+  matchers: QuerySearchMatchers
+): EvaluatedPageMatch | null {
+  if (!rawText) return null;
+  const normText = normaliserTexte(rawText);
+
+  // Fast pre-check before running regexes
+  const hasQuickSubstring = normText.includes(matchers.qNorm);
+  const partialFallback = hasQuickSubstring
+    ? null
+    : findFirstRegexMatch(matchers.regexPartiel, normText);
+  if (!hasQuickSubstring && !partialFallback) {
+    return null;
+  }
+
+  const exactMatches = collectRegexMatches(matchers.regexMotExact, normText);
+  let matchLevel: 2 | 3 | 4;
+  let score: number;
+  let anchor: {index: number; length: number} | null = null;
+
+  if (exactMatches.length > 0) {
+    matchLevel = 2;
+    score = 500 + Math.min(200, exactMatches.length * 10);
+    anchor = exactMatches[0];
+  } else {
+    const prefixMatch = findFirstRegexMatch(matchers.regexDebutMot, normText);
+    if (prefixMatch) {
+      matchLevel = 3;
+      score = 50;
+      anchor = prefixMatch;
+    } else {
+      matchLevel = 4;
+      score = 1;
+      const idx = normText.indexOf(matchers.qNorm);
+      anchor =
+        idx >= 0
+          ? {index: idx, length: matchers.qNorm.length}
+          : partialFallback;
     }
   }
 
-  return new Promise((resolve, reject) => {
+  let rawMatchStart = 0;
+  let rawMatchLen = 0;
+  if (anchor) {
+    const {rawStart, rawEnd} = buildNormalizedTextMap(rawText);
+    const endIdx = anchor.index + anchor.length - 1;
+    if (anchor.index < rawStart.length && endIdx < rawEnd.length) {
+      rawMatchStart = rawStart[anchor.index];
+      rawMatchLen = rawEnd[endIdx] - rawMatchStart;
+    }
+  }
+
+  return {
+    score,
+    matchLevel,
+    exactCount: exactMatches.length,
+    snippet: extractSnippet(rawText, rawMatchStart, rawMatchLen),
+  };
+}
+
+interface ScoredSearchEntry {
+  result: SearchResult;
+  exactCount: number;
+}
+
+function sortAndSliceScoredResults(
+  entries: ScoredSearchEntry[],
+  maxResults: number,
+  wholeWordOnly: boolean
+): SearchResult[] {
+  const filtered = wholeWordOnly
+    ? entries.filter((e) => e.result.matchLevel !== 4)
+    : entries;
+
+  filtered.sort((a, b) => {
+    const scoreDiff = (b.result.score ?? 0) - (a.result.score ?? 0);
+    if (scoreDiff !== 0) return scoreDiff;
+    const levelDiff = (a.result.matchLevel ?? 4) - (b.result.matchLevel ?? 4);
+    if (levelDiff !== 0) return levelDiff;
+    const exactDiff = b.exactCount - a.exactCount;
+    if (exactDiff !== 0) return exactDiff;
+    if (a.result.matchType !== b.result.matchType) {
+      return a.result.matchType === 'filename' ? -1 : 1;
+    }
+    return a.result.pageNumber - b.result.pageNumber;
+  });
+
+  return filtered.slice(0, maxResults).map((e) => e.result);
+}
+
+/**
+ * Streaming cursor-based search across local IndexedDB with 4-tier relevance scoring.
+ * Keeps RAM footprint O(1) per page while evaluating all pages so high-relevance hits
+ * always surface first.
+ */
+export async function searchIndexedLibrary(
+  query: string,
+  maxResults = 80,
+  options?: {wholeWordOnly?: boolean}
+): Promise<SearchResult[]> {
+  const matchers = buildQuerySearchMatchers(query);
+  if (!matchers) return [];
+  const wholeWordOnly = !!options?.wholeWordOnly;
+
+  const db = await openDatabase();
+  const docsMap = await getAllIndexedDocuments();
+  const scoredEntries: ScoredSearchEntry[] = [];
+
+  for (const doc of docsMap.values()) {
+    const titleHit = evaluateTitleMatch(doc, matchers);
+    if (titleHit) {
+      scoredEntries.push({
+        exactCount: titleHit.matchLevel === 1 ? 1 : 0,
+        result: {
+          docPath: doc.relativePath,
+          fileName: doc.name,
+          subject: doc.subject,
+          professor: doc.professor,
+          pageNumber: 1,
+          snippet: `Correspondance dans le nom ou classement (${doc.subject} / ${doc.professor})`,
+          matchType: 'filename',
+          score: titleHit.score,
+          matchLevel: titleHit.matchLevel,
+        },
+      });
+    }
+  }
+
+  await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE_PAGES, 'readonly');
     const store = tx.objectStore(STORE_PAGES);
     const req = store.openCursor();
 
     req.onsuccess = () => {
       const cursor = req.result;
-      if (!cursor || results.length >= maxResults) {
-        resolve(results);
+      if (!cursor) {
+        resolve();
         return;
       }
 
       const record = cursor.value as StoredPageText;
-      const match = regex.exec(record.text);
-      if (match) {
+      const evaluated = evaluatePageTextMatch(record.text, matchers);
+      if (evaluated) {
         const doc = docsMap.get(record.docPath);
         if (doc) {
-          results.push({
-            docPath: doc.relativePath,
-            fileName: doc.name,
-            subject: doc.subject,
-            professor: doc.professor,
-            pageNumber: record.pageNumber,
-            snippet: extractSnippet(record.text, match.index, match[0].length),
-            matchType: 'content',
+          scoredEntries.push({
+            exactCount: evaluated.exactCount,
+            result: {
+              docPath: doc.relativePath,
+              fileName: doc.name,
+              subject: doc.subject,
+              professor: doc.professor,
+              pageNumber: record.pageNumber,
+              snippet: evaluated.snippet,
+              matchType: 'content',
+              score: evaluated.score,
+              matchLevel: evaluated.matchLevel,
+            },
           });
         }
       }
@@ -493,59 +759,72 @@ export async function searchIndexedLibrary(
 
     req.onerror = () => reject(req.error);
   });
+
+  return sortAndSliceScoredResults(scoredEntries, maxResults, wholeWordOnly);
 }
 
 /**
- * Instant search across the lightweight `search_index.json` cached from Google Drive.
+ * Instant search across the lightweight `search_index.json` cached from Google Drive,
+ * ranked by the same 4-tier relevance scoring algorithm.
  */
 export function searchCloudIndexPayload(
   payload: CloudSearchIndexPayload | null,
   query: string,
   fallbackDocs: Array<{relativePath: string; name: string; subject: string; professor: string}>,
-  maxResults = 80
+  maxResults = 80,
+  options?: {wholeWordOnly?: boolean}
 ): SearchResult[] {
-  const regex = buildAccentInsensitiveRegex(query);
-  if (!regex) return [];
+  const matchers = buildQuerySearchMatchers(query);
+  if (!matchers) return [];
+  const wholeWordOnly = !!options?.wholeWordOnly;
 
-  const results: SearchResult[] = [];
+  const scoredEntries: ScoredSearchEntry[] = [];
   const docList = payload?.documents ?? [];
 
   // 1. Filename / classification matches (uses live Drive tree even if search_index.json is missing)
   const metaSource = docList.length > 0 ? docList : fallbackDocs;
   for (const doc of metaSource) {
-    const composite = `${doc.name} ${doc.subject} ${doc.professor}`;
-    if (regex.test(composite)) {
-      results.push({
-        docPath: doc.relativePath,
-        fileName: doc.name,
-        subject: doc.subject,
-        professor: doc.professor,
-        pageNumber: 1,
-        snippet: `Correspondance dans le nom ou classement (${doc.subject} / ${doc.professor})`,
-        matchType: 'filename',
+    const titleHit = evaluateTitleMatch(doc, matchers);
+    if (titleHit) {
+      scoredEntries.push({
+        exactCount: titleHit.matchLevel === 1 ? 1 : 0,
+        result: {
+          docPath: doc.relativePath,
+          fileName: doc.name,
+          subject: doc.subject,
+          professor: doc.professor,
+          pageNumber: 1,
+          snippet: `Correspondance dans le nom ou classement (${doc.subject} / ${doc.professor})`,
+          matchType: 'filename',
+          score: titleHit.score,
+          matchLevel: titleHit.matchLevel,
+        },
       });
-      if (results.length >= maxResults) return results;
     }
   }
 
   // 2. Full-text page matches inside cached search_index.json
   for (const doc of docList) {
     for (const page of doc.pages) {
-      const match = regex.exec(page.t);
-      if (match) {
-        results.push({
-          docPath: doc.relativePath,
-          fileName: doc.name,
-          subject: doc.subject,
-          professor: doc.professor,
-          pageNumber: page.p,
-          snippet: extractSnippet(page.t, match.index, match[0].length),
-          matchType: 'content',
+      const evaluated = evaluatePageTextMatch(page.t, matchers);
+      if (evaluated) {
+        scoredEntries.push({
+          exactCount: evaluated.exactCount,
+          result: {
+            docPath: doc.relativePath,
+            fileName: doc.name,
+            subject: doc.subject,
+            professor: doc.professor,
+            pageNumber: page.p,
+            snippet: evaluated.snippet,
+            matchType: 'content',
+            score: evaluated.score,
+            matchLevel: evaluated.matchLevel,
+          },
         });
-        if (results.length >= maxResults) return results;
       }
     }
   }
 
-  return results;
+  return sortAndSliceScoredResults(scoredEntries, maxResults, wholeWordOnly);
 }

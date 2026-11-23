@@ -110,6 +110,8 @@ export interface SearchResult {
   pageNumber: number;
   snippet: string;
   matchType: 'filename' | 'content';
+  score?: number;
+  matchLevel?: 1 | 2 | 3 | 4;
 }
 
 export interface DriveSyncRecord {
