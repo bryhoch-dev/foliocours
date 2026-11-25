@@ -435,13 +435,15 @@ export interface GeminiCallOptions {
   contents?: Array<{role: 'user' | 'model'; parts: Array<{text: string}>}>;
   systemInstruction?: {parts: Array<{text: string}>};
   generationConfig?: Record<string, unknown>;
-  preferredModel?: string;
+  preferredModel?: string | null;
+  timeout?: number;
   timeoutMs?: number;
   signal?: AbortSignal;
   onStatus?: (message: string) => void;
 }
 
 export interface GeminiCallResult {
+  data: string;
   text: string;
   modelUsed: string;
 }
@@ -528,16 +530,19 @@ export async function appelerGeminiAvecSecours(
   }
 
   const sanitizedSaved = sanitizeStoredGeminiModels();
-  const rawPreferred = normalizeModelName(
-    options.preferredModel?.trim() || sanitizedSaved
-  );
-  const preferred =
-    !rawPreferred || isLegacyClosedModel(rawPreferred) || !isEligibleTextGeminiModel(rawPreferred)
-      ? DEFAULT_GEMINI_MODEL
-      : rawPreferred;
+  const rawExplicitPreferred = options.preferredModel?.trim()
+    ? normalizeModelName(options.preferredModel.trim())
+    : '';
+  const explicitPreferred =
+    rawExplicitPreferred &&
+    !isLegacyClosedModel(rawExplicitPreferred) &&
+    isEligibleTextGeminiModel(rawExplicitPreferred)
+      ? rawExplicitPreferred
+      : '';
 
   const fastSessionModel = getSessionFastModel();
-  const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const timeoutMs =
+    options.timeout ?? options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
   const discovered = await discoverCompatibleModels(apiKey, options.signal);
   const discoveredGemini3 = discovered.filter((m) =>
@@ -555,8 +560,9 @@ export async function appelerGeminiAvecSecours(
 
   const candidateModels = Array.from(
     new Set([
+      ...(explicitPreferred ? [explicitPreferred] : []),
       ...(fastSessionModel ? [fastSessionModel] : []),
-      preferred,
+      sanitizedSaved,
       DEFAULT_GEMINI_MODEL,
       ...staticGemini3,
       ...discoveredGemini3,
@@ -682,7 +688,7 @@ export async function appelerGeminiAvecSecours(
       }
 
       saveSessionFastModel(model);
-      return {text, modelUsed: model};
+      return {data: text, text, modelUsed: model};
     } catch (err) {
       if (options.signal?.aborted) {
         throw new DOMException('Requête annulée.', 'AbortError');
@@ -791,7 +797,7 @@ export async function generateFolderQuiz(params: {
     contextBlock,
   ].join('\n');
 
-  const {text: rawResponse, modelUsed} = await appelerGeminiAvecSecours(prompt, {
+  const {data: rawResponse, modelUsed} = await appelerGeminiAvecSecours(prompt, {
     signal,
     onStatus,
     timeoutMs: QUIZ_REQUEST_TIMEOUT_MS,
@@ -1145,6 +1151,7 @@ export async function evaluateOpenQuizAnswer(params: {
   expectedAnswer: string;
   referenceExplanation: string;
   userAnswer: string;
+  preferredModel?: string | null;
   signal?: AbortSignal;
   onStatus?: (message: string) => void;
 }): Promise<OpenQuizEvaluationResult> {
@@ -1153,6 +1160,7 @@ export async function evaluateOpenQuizAnswer(params: {
     expectedAnswer,
     referenceExplanation,
     userAnswer,
+    preferredModel,
     signal,
     onStatus,
   } = params;
@@ -1194,10 +1202,11 @@ export async function evaluateOpenQuizAnswer(params: {
   ].join('\n');
 
   try {
-    const {text: rawResponse, modelUsed} = await appelerGeminiAvecSecours(prompt, {
+    const {data: rawResponse, modelUsed} = await appelerGeminiAvecSecours(prompt, {
+      preferredModel,
       signal,
       onStatus,
-      timeoutMs: OPEN_EVAL_REQUEST_TIMEOUT_MS,
+      timeout: OPEN_EVAL_REQUEST_TIMEOUT_MS,
       generationConfig: {
         temperature: 0.1,
       },

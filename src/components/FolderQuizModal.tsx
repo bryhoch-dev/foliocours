@@ -134,6 +134,7 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
   const [loadingStepLabel, setLoadingStepLabel] = useState('');
   const [fallbackStatusMessage, setFallbackStatusMessage] = useState<string | null>(null);
   const [usedModelLabel, setUsedModelLabel] = useState<string | null>(null);
+  const [quizGeneratorModel, setQuizGeneratorModel] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isMissingKeyErr, setIsMissingKeyErr] = useState(false);
   const [offerOfflineFallback, setOfferOfflineFallback] = useState(false);
@@ -166,6 +167,7 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
     setOfferOfflineFallback(false);
     setFallbackStatusMessage(null);
     setUsedModelLabel(null);
+    setQuizGeneratorModel(null);
     setLoadingProgress(null);
     setLoadingStepLabel('');
     setQuestions([]);
@@ -247,6 +249,7 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
     setOfferOfflineFallback(false);
     setFallbackStatusMessage(null);
     setUsedModelLabel(null);
+    setQuizGeneratorModel(null);
     setLoadingProgress(null);
     setLoadingStepLabel('Préparation des cours du dossier…');
 
@@ -292,6 +295,7 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
       if (controller.signal.aborted) return;
 
       setQuestions(generated);
+      setQuizGeneratorModel(modelUsed);
       setUsedModelLabel(`Répondu via ${modelUsed}`);
       setFallbackStatusMessage(null);
       setCurrentIdx(0);
@@ -361,6 +365,7 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
       });
 
       setQuestions(generated);
+      setQuizGeneratorModel(null);
       setUsedModelLabel('Mode hors-ligne (sans IA)');
       setCurrentIdx(0);
       setAnswers({});
@@ -417,6 +422,7 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
         expectedAnswer: q.reponseCorrecte,
         referenceExplanation: q.explication,
         userAnswer: trimmed,
+        preferredModel: quizGeneratorModel,
         signal: controller.signal,
         onStatus: (msg) => {
           setEvalStatusMessage(msg);

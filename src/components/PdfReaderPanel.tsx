@@ -113,6 +113,13 @@ interface ZoomStateSnapshot {
   fitMode: ReaderFitMode;
 }
 
+const CLASSIC_ZOOM_SCALE = 1.4;
+
+let persistedReaderZoomState: ZoomStateSnapshot = {
+  scale: CLASSIC_ZOOM_SCALE,
+  fitMode: 'custom',
+};
+
 type PendingZoomAnchor =
   | {
       type: 'pointer';
@@ -978,10 +985,10 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   const officeNaturalWidthRef = useRef<number>(794);
 
   // Smooth zoom & scroll synchronization refs
-  const [scale, setScale] = useState(1.0);
-  const scaleRef = useRef(1.0);
-  const [fitMode, setFitMode] = useState<ReaderFitMode>('default');
-  const fitModeRef = useRef<ReaderFitMode>('default');
+  const [scale, setScale] = useState(persistedReaderZoomState.scale);
+  const scaleRef = useRef(persistedReaderZoomState.scale);
+  const [fitMode, setFitMode] = useState<ReaderFitMode>(persistedReaderZoomState.fitMode);
+  const fitModeRef = useRef<ReaderFitMode>(persistedReaderZoomState.fitMode);
   const previousZoomStateRef = useRef<ZoomStateSnapshot | null>(null);
   const pendingZoomAnchorRef = useRef<PendingZoomAnchor | null>(null);
   const lastScrollReportedPageRef = useRef<number>(targetPage);
@@ -996,7 +1003,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   const usedNativeFullscreenRef = useRef(false);
   const fullscreenAdjustTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fullscreenRafRef = useRef<number | null>(null);
-  const lastFullscreenFittedDocRef = useRef<string | null>(null);
+  const lastFittedDocRef = useRef<string | null>(null);
   const [copiedPath, setCopiedPath] = useState(false);
 
   // Touch gesture tracking (pinch zoom + double-tap)
@@ -1183,6 +1190,13 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       setFitMode(nextFitMode);
 
       const nextScale = Number(Math.max(0.4, Math.min(4.5, nextScaleRaw)).toFixed(2));
+      if (!isFullscreenRef.current) {
+        persistedReaderZoomState = {
+          scale: nextScale,
+          fitMode: nextFitMode,
+        };
+      }
+
       const oldScale = scaleRef.current;
       if (nextScale === oldScale) return;
 
@@ -1409,14 +1423,13 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       setError(null);
       setCopiedPath(false);
       lastHandledJumpRef.current = null;
+      lastFittedDocRef.current = null;
       pendingZoomAnchorRef.current = null;
       if (containerRef.current) {
         containerRef.current.scrollTop = 0;
       }
       if (!isFullscreenRef.current) {
         previousZoomStateRef.current = null;
-        fitModeRef.current = 'default';
-        setFitMode('default');
       }
 
       if (!courseDoc) return;
@@ -1453,13 +1466,6 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
             return;
           }
 
-          const container = containerRef.current;
-          const padding = window.innerWidth < 768 ? 20 : 48;
-          const available = Math.max(260, (container?.clientWidth || 720) - padding);
-          const initialScale = Number(
-            Math.min(1.4, Math.max(0.45, available / vp1.width)).toFixed(2)
-          );
-
           const initialDims: PageDimension[] = Array.from(
             {length: pdf.numPages},
             () => ({width: vp1.width, height: vp1.height})
@@ -1468,9 +1474,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
           const startPage = Math.max(1, Math.min(pdf.numPages, targetPage));
 
           pdfInstanceRef.current = pdf;
-          scaleRef.current = initialScale;
           lastScrollReportedPageRef.current = startPage;
-          setScale(initialScale);
           setPageDimensions(initialDims);
           setPdfDoc(pdf);
           setNumPages(pdf.numPages);
@@ -1533,14 +1537,6 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
           }
           if (cancelled) return;
 
-          const container = containerRef.current;
-          const padding = window.innerWidth < 768 ? 20 : 48;
-          const available = Math.max(260, (container?.clientWidth || 720) - padding);
-          const initialScale = Number(
-            Math.min(1.15, Math.max(0.4, available / 820)).toFixed(2)
-          );
-          scaleRef.current = initialScale;
-          setScale(initialScale);
           setDocxPreviewError(null);
           setDocxFallbackHtml(null);
           setDocxFallbackText(null);
@@ -1557,15 +1553,6 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
           }
 
           odtObjectUrlsRef.current = parsed.objectUrls;
-
-          const container = containerRef.current;
-          const padding = window.innerWidth < 768 ? 20 : 48;
-          const available = Math.max(260, (container?.clientWidth || 720) - padding);
-          const initialScale = Number(
-            Math.min(1.15, Math.max(0.4, available / 794)).toFixed(2)
-          );
-          scaleRef.current = initialScale;
-          setScale(initialScale);
           setOdtDoc(parsed);
         }
       } catch (err) {
@@ -1852,29 +1839,19 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     };
   }, [hasLoadedContent, applyZoom]);
 
-  const computeDefaultInitialScale = useCallback((): number | null => {
-    const container = containerRef.current;
-    const padding = window.innerWidth < 768 ? 20 : 48;
-    const available = Math.max(260, (container?.clientWidth || 720) - padding);
-
-    if (docFormat === 'pdf') {
-      const dim = pageDimensions[currentPage - 1] || pageDimensions[0];
-      if (!dim) return null;
-      return Number(Math.min(1.4, Math.max(0.45, available / dim.width)).toFixed(2));
-    }
-    if (docFormat === 'docx') {
-      const natW = officeNaturalWidthRef.current || 820;
-      return Number(Math.min(1.15, Math.max(0.4, available / natW)).toFixed(2));
-    }
-    const natW = officeNaturalWidthRef.current || 794;
-    return Number(Math.min(1.15, Math.max(0.4, available / natW)).toFixed(2));
-  }, [currentPage, docFormat, pageDimensions]);
+  const handleClassicZoom = useCallback(() => {
+    applyZoom(CLASSIC_ZOOM_SCALE, undefined, 'custom');
+  }, [applyZoom]);
 
   const handleFitWidth = useCallback(() => {
     const container = containerRef.current;
     if (!container) return;
     const padding = window.innerWidth < 768 ? 20 : 48;
     const available = Math.max(260, container.clientWidth - padding);
+
+    if (courseDoc) {
+      lastFittedDocRef.current = courseDoc.relativePath;
+    }
 
     if (docFormat === 'pdf') {
       const dim = pageDimensions[currentPage - 1] || pageDimensions[0];
@@ -1884,7 +1861,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       const natW = officeNaturalWidthRef.current || 794;
       applyZoom(available / natW, undefined, 'fit-width');
     }
-  }, [applyZoom, currentPage, docFormat, pageDimensions]);
+  }, [applyZoom, courseDoc, currentPage, docFormat, pageDimensions]);
 
   const cancelPendingFullscreenAdjustment = useCallback(() => {
     if (fullscreenAdjustTimerRef.current) {
@@ -1922,11 +1899,8 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
         fullscreenRafRef.current = null;
         if (saved?.fitMode === 'fit-width') {
           handleFitWidth();
-        } else if (saved?.fitMode === 'custom') {
-          applyZoom(saved.scale, undefined, 'custom');
         } else {
-          const defaultScale = computeDefaultInitialScale();
-          applyZoom(defaultScale ?? saved?.scale ?? 1.0, undefined, 'default');
+          applyZoom(saved?.scale ?? CLASSIC_ZOOM_SCALE, undefined, 'custom');
         }
         if (docFormat !== 'pdf') {
           requestAnimationFrame(() => updateOfficeScaleLayout());
@@ -1936,7 +1910,6 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   }, [
     applyZoom,
     cancelPendingFullscreenAdjustment,
-    computeDefaultInitialScale,
     docFormat,
     handleFitWidth,
     updateOfficeScaleLayout,
@@ -2018,14 +1991,14 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
 
     if (isFullscreen) {
       if (courseDoc && hasLoadedContent) {
-        lastFullscreenFittedDocRef.current = courseDoc.relativePath;
+        lastFittedDocRef.current = courseDoc.relativePath;
       }
       scheduleFullscreenFitWidth();
     } else if (courseDoc) {
-      lastFullscreenFittedDocRef.current = null;
+      lastFittedDocRef.current = null;
       scheduleRestoreZoomAfterFullscreen();
     } else {
-      lastFullscreenFittedDocRef.current = null;
+      lastFittedDocRef.current = null;
       previousZoomStateRef.current = null;
       cancelPendingFullscreenAdjustment();
     }
@@ -2038,24 +2011,33 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     cancelPendingFullscreenAdjustment,
   ]);
 
-  // Re-apply fit-to-width and reset scroll to top when switching documents while in fullscreen
+  // Recalculate fit-to-width automatically when switching documents while fit-width mode is active
   useEffect(() => {
-    if (!isFullscreen || !courseDoc || isLoading || !hasLoadedContent) return;
-    if (lastFullscreenFittedDocRef.current === courseDoc.relativePath) return;
+    if (!courseDoc || isLoading || !hasLoadedContent) return;
+    if (fitModeRef.current !== 'fit-width') return;
+    if (lastFittedDocRef.current === courseDoc.relativePath) return;
 
-    lastFullscreenFittedDocRef.current = courseDoc.relativePath;
+    lastFittedDocRef.current = courseDoc.relativePath;
     if (containerRef.current && targetPage <= 1) {
       containerRef.current.scrollTop = 0;
     }
-    scheduleFullscreenFitWidth();
-  }, [
-    isFullscreen,
-    courseDoc,
-    isLoading,
-    hasLoadedContent,
-    targetPage,
-    scheduleFullscreenFitWidth,
-  ]);
+
+    let innerRaf: number | null = null;
+    const outerRaf = requestAnimationFrame(() => {
+      innerRaf = requestAnimationFrame(() => {
+        if (fitModeRef.current === 'fit-width') {
+          handleFitWidth();
+        }
+      });
+    });
+
+    return () => {
+      cancelAnimationFrame(outerRaf);
+      if (innerRaf !== null) {
+        cancelAnimationFrame(innerRaf);
+      }
+    };
+  }, [courseDoc, isLoading, hasLoadedContent, fitMode, targetPage, handleFitWidth]);
 
   useEffect(() => {
     if (!courseDoc && isFullscreen) {
@@ -2745,7 +2727,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
             </div>
           )}
 
-          {/* Zoom controls (- / % / + / Largeur) */}
+          {/* Zoom controls (- / % / + / Classique / Largeur) */}
           <div className="flex items-center gap-0.5 rounded-md border border-slate-800 bg-[#0B1120] px-1 py-0.5 shrink-0">
             <button
               type="button"
@@ -2770,14 +2752,28 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
             </button>
             <button
               type="button"
+              onClick={handleClassicZoom}
+              disabled={!hasLoadedContent}
+              title="Zoom classique (140 %)"
+              aria-label="Zoom classique (140 %)"
+              className={`min-h-[28px] inline-flex items-center px-1.5 rounded text-[11px] font-medium disabled:opacity-35 cursor-pointer whitespace-nowrap shrink-0 transition-colors ${
+                fitMode !== 'fit-width' && Math.round(scale * 100) === 140
+                  ? 'bg-amber-500/15 text-amber-300 border border-amber-500/40'
+                  : 'text-slate-400 hover:text-amber-300 border border-transparent'
+              }`}
+            >
+              Classique
+            </button>
+            <button
+              type="button"
               onClick={handleFitWidth}
               disabled={!hasLoadedContent}
               title="Ajuster à la largeur"
               aria-label="Ajuster à la largeur"
-              className={`min-h-[30px] inline-flex items-center gap-1 px-1.5 disabled:opacity-35 cursor-pointer whitespace-nowrap shrink-0 transition-colors ${
+              className={`min-h-[28px] inline-flex items-center gap-1 px-1.5 rounded disabled:opacity-35 cursor-pointer whitespace-nowrap shrink-0 transition-colors ${
                 fitMode === 'fit-width'
-                  ? 'text-amber-300'
-                  : 'text-slate-400 hover:text-amber-300'
+                  ? 'bg-amber-500/15 text-amber-300 border border-amber-500/40'
+                  : 'text-slate-400 hover:text-amber-300 border border-transparent'
               }`}
             >
               <MoveHorizontal className="w-3.5 h-3.5" />
