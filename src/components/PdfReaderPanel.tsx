@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState} from 'react';
 import type {PDFDocumentProxy, RenderTask} from 'pdfjs-dist';
 import JSZip from 'jszip';
 import {renderAsync as renderDocxAsync} from 'docx-preview';
@@ -12,6 +12,7 @@ import {
   ExternalLink,
   FileSearch,
   FolderOpen,
+  Loader2,
   Maximize2,
   Minimize2,
   MoveHorizontal,
@@ -935,6 +936,17 @@ function buildContextSliceFromPages(
   };
 }
 
+function getParentFolderKey(relativePath: string): string {
+  const normalized = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+  const idx = normalized.lastIndexOf('/');
+  return idx === -1 ? '' : normalized.slice(0, idx).toLowerCase();
+}
+
+function getNormalizedFileExtension(fileName: string): string {
+  const idx = fileName.lastIndexOf('.');
+  return idx === -1 ? '' : fileName.slice(idx).toLowerCase();
+}
+
 export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
   document: courseDoc,
   mode = 'local',
@@ -978,10 +990,13 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
 
   // Fullscreen & copy feedback state
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const isFullscreenRef = useRef(false);
+  isFullscreenRef.current = isFullscreen;
   const prevIsFullscreenRef = useRef(false);
   const usedNativeFullscreenRef = useRef(false);
   const fullscreenAdjustTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fullscreenRafRef = useRef<number | null>(null);
+  const lastFullscreenFittedDocRef = useRef<string | null>(null);
   const [copiedPath, setCopiedPath] = useState(false);
 
   // Touch gesture tracking (pinch zoom + double-tap)
@@ -1054,6 +1069,59 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
 
   const hasLoadedContent =
     docFormat === 'pdf' ? numPages > 0 : docFormat === 'docx' ? docxReady : !!odtDoc;
+
+  // Same-folder, same-extension sibling courses sorted naturally (e.g. CM2 before CM10)
+  const {folderSiblings, currentDocIndex, prevCourseDoc, nextCourseDoc} = useMemo(() => {
+    if (!courseDoc || allDocuments.length === 0) {
+      return {
+        folderSiblings: [] as CourseDocument[],
+        currentDocIndex: -1,
+        prevCourseDoc: null as CourseDocument | null,
+        nextCourseDoc: null as CourseDocument | null,
+      };
+    }
+
+    const activeParentKey = getParentFolderKey(courseDoc.relativePath);
+    const activeExt =
+      getNormalizedFileExtension(courseDoc.name) || `.${docFormat}`;
+
+    const siblings = allDocuments
+      .filter((doc) => {
+        if (doc.source !== courseDoc.source) return false;
+        if (getParentFolderKey(doc.relativePath) !== activeParentKey) return false;
+        const ext =
+          getNormalizedFileExtension(doc.name) ||
+          `.${doc.format ?? getCourseFileFormat(doc.name) ?? 'pdf'}`;
+        return ext === activeExt;
+      })
+      .sort((a, b) => {
+        const cmp = a.name.localeCompare(b.name, 'fr', {
+          numeric: true,
+          sensitivity: 'base',
+        });
+        return cmp !== 0 ? cmp : a.relativePath.localeCompare(b.relativePath);
+      });
+
+    const idx = siblings.findIndex(
+      (d) => d.relativePath === courseDoc.relativePath
+    );
+
+    return {
+      folderSiblings: siblings,
+      currentDocIndex: idx,
+      prevCourseDoc: idx > 0 ? siblings[idx - 1] : null,
+      nextCourseDoc:
+        idx >= 0 && idx < siblings.length - 1 ? siblings[idx + 1] : null,
+    };
+  }, [courseDoc, allDocuments, docFormat]);
+
+  const handleNavigateSiblingCourse = useCallback(
+    (targetDoc: CourseDocument | null) => {
+      if (!targetDoc || !onOpenDocument) return;
+      onOpenDocument(targetDoc, 1, '');
+    },
+    [onOpenDocument]
+  );
 
   // Scroll cleanly to a specific page (PDF) or proportional position (DOCX/ODT)
   const scrollToPage = useCallback(
@@ -1214,6 +1282,13 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       if (doc.source === 'cloud' && doc.driveFileId) {
         const cached = await getCachedCloudFile(doc.driveFileId).catch(() => null);
 
+        if (
+          cached &&
+          (!doc.driveModifiedTime || cached.modifiedTime === doc.driveModifiedTime)
+        ) {
+          return {bytes: new Uint8Array(await cached.blob.arrayBuffer())};
+        }
+
         if (typeof navigator !== 'undefined' && !navigator.onLine && cached) {
           return {bytes: new Uint8Array(await cached.blob.arrayBuffer())};
         }
@@ -1334,9 +1409,15 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       setError(null);
       setCopiedPath(false);
       lastHandledJumpRef.current = null;
-      previousZoomStateRef.current = null;
-      fitModeRef.current = 'default';
-      setFitMode('default');
+      pendingZoomAnchorRef.current = null;
+      if (containerRef.current) {
+        containerRef.current.scrollTop = 0;
+      }
+      if (!isFullscreenRef.current) {
+        previousZoomStateRef.current = null;
+        fitModeRef.current = 'default';
+        setFitMode('default');
+      }
 
       if (!courseDoc) return;
 
@@ -1662,7 +1743,8 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
         const slotEl = pageSlotRefs.current.get(clamped);
         if (container && slotEl) {
           suppressObserverUntilRef.current = Date.now() + 180;
-          container.scrollTop = Math.max(0, slotEl.offsetTop - 16);
+          container.scrollTop =
+            clamped === 1 ? 0 : Math.max(0, slotEl.offsetTop - 16);
         }
       });
       return () => cancelAnimationFrame(raf);
@@ -1884,6 +1966,32 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       if (e.key === 'Escape' && isFullscreen && !window.document.fullscreenElement) {
         e.preventDefault();
         setIsFullscreen(false);
+        return;
+      }
+
+      if (
+        courseDoc &&
+        e.altKey &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.shiftKey &&
+        !(
+          e.target instanceof HTMLInputElement ||
+          e.target instanceof HTMLTextAreaElement ||
+          (e.target instanceof HTMLElement && e.target.isContentEditable)
+        )
+      ) {
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          if (prevCourseDoc) {
+            handleNavigateSiblingCourse(prevCourseDoc);
+          }
+        } else if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          if (nextCourseDoc) {
+            handleNavigateSiblingCourse(nextCourseDoc);
+          }
+        }
       }
     };
 
@@ -1893,7 +2001,14 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
       window.document.removeEventListener('fullscreenchange', handleFullscreenChange);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [isFullscreen, scheduleFullscreenFitWidth]);
+  }, [
+    isFullscreen,
+    courseDoc,
+    prevCourseDoc,
+    nextCourseDoc,
+    handleNavigateSiblingCourse,
+    scheduleFullscreenFitWidth,
+  ]);
 
   // React to fullscreen enter/exit transitions (including button click, Escape, and fullscreenchange)
   useEffect(() => {
@@ -1902,19 +2017,44 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
     prevIsFullscreenRef.current = isFullscreen;
 
     if (isFullscreen) {
+      if (courseDoc && hasLoadedContent) {
+        lastFullscreenFittedDocRef.current = courseDoc.relativePath;
+      }
       scheduleFullscreenFitWidth();
     } else if (courseDoc) {
+      lastFullscreenFittedDocRef.current = null;
       scheduleRestoreZoomAfterFullscreen();
     } else {
+      lastFullscreenFittedDocRef.current = null;
       previousZoomStateRef.current = null;
       cancelPendingFullscreenAdjustment();
     }
   }, [
     isFullscreen,
     courseDoc,
+    hasLoadedContent,
     scheduleFullscreenFitWidth,
     scheduleRestoreZoomAfterFullscreen,
     cancelPendingFullscreenAdjustment,
+  ]);
+
+  // Re-apply fit-to-width and reset scroll to top when switching documents while in fullscreen
+  useEffect(() => {
+    if (!isFullscreen || !courseDoc || isLoading || !hasLoadedContent) return;
+    if (lastFullscreenFittedDocRef.current === courseDoc.relativePath) return;
+
+    lastFullscreenFittedDocRef.current = courseDoc.relativePath;
+    if (containerRef.current && targetPage <= 1) {
+      containerRef.current.scrollTop = 0;
+    }
+    scheduleFullscreenFitWidth();
+  }, [
+    isFullscreen,
+    courseDoc,
+    isLoading,
+    hasLoadedContent,
+    targetPage,
+    scheduleFullscreenFitWidth,
   ]);
 
   useEffect(() => {
@@ -1933,6 +2073,7 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
         scale: scaleRef.current,
         fitMode: fitModeRef.current,
       };
+      isFullscreenRef.current = true;
       setIsFullscreen(true);
       const el = readerRootRef.current;
       if (el?.requestFullscreen) {
@@ -2519,6 +2660,49 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5 shrink-0 max-w-full justify-end">
+          {/* Same-folder, same-extension course navigation (Previous / Counter / Next) */}
+          {folderSiblings.length > 0 && onOpenDocument && (
+            <div className="flex items-center gap-0.5 rounded-md border border-slate-800 bg-[#0B1120] px-1 py-0.5 shrink-0">
+              <button
+                type="button"
+                disabled={!prevCourseDoc}
+                onClick={() => handleNavigateSiblingCourse(prevCourseDoc)}
+                title={
+                  prevCourseDoc
+                    ? `Cours précédent : ${prevCourseDoc.name} (Alt + ←)`
+                    : 'Premier cours de ce dossier'
+                }
+                aria-label="Cours précédent"
+                className="min-h-[30px] inline-flex items-center gap-1 rounded px-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-amber-300 disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-slate-300 cursor-pointer disabled:cursor-default whitespace-nowrap transition-colors"
+              >
+                <ChevronLeft className="w-3.5 h-3.5 shrink-0" />
+                <span className={isFullscreen ? 'inline' : 'hidden lg:inline'}>
+                  Précédent
+                </span>
+              </button>
+              <span className="font-mono tabular-nums text-[11px] text-slate-400 px-1.5 whitespace-nowrap">
+                {currentDocIndex >= 0 ? currentDocIndex + 1 : 1} / {folderSiblings.length}
+              </span>
+              <button
+                type="button"
+                disabled={!nextCourseDoc}
+                onClick={() => handleNavigateSiblingCourse(nextCourseDoc)}
+                title={
+                  nextCourseDoc
+                    ? `Cours suivant : ${nextCourseDoc.name} (Alt + →)`
+                    : 'Dernier cours de ce dossier'
+                }
+                aria-label="Cours suivant"
+                className="min-h-[30px] inline-flex items-center gap-1 rounded px-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-amber-300 disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-slate-300 cursor-pointer disabled:cursor-default whitespace-nowrap transition-colors"
+              >
+                <span className={isFullscreen ? 'inline' : 'hidden lg:inline'}>
+                  Suivant
+                </span>
+                <ChevronRight className="w-3.5 h-3.5 shrink-0" />
+              </button>
+            </div>
+          )}
+
           {/* Page navigation (for PDF) */}
           {docFormat === 'pdf' && (
             <div className="flex items-center gap-0.5 rounded-md border border-slate-800 bg-[#0B1120] px-1 py-0.5 shrink-0">
@@ -2696,7 +2880,12 @@ export const PdfReaderPanel: React.FC<PdfReaderPanelProps> = ({
           }`}
         >
           {isLoading ? (
-            <div className="my-auto text-center space-y-2 px-4">
+            <div className="my-auto text-center space-y-2 px-4 flex flex-col items-center">
+              <Loader2
+                className={`w-5 h-5 animate-spin ${
+                  docFormat === 'pdf' ? 'text-amber-400' : 'text-amber-600'
+                }`}
+              />
               <p
                 className={`text-xs ${
                   docFormat === 'pdf' ? 'text-slate-300' : 'text-slate-700 font-medium'

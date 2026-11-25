@@ -186,3 +186,17 @@ export interface GeminiChatTurn {
   role: 'user' | 'model';
   text: string;
 }
+
+export type OpenQuizAnswerStatus =
+  | 'totalement_correcte'
+  | 'partiellement_correcte'
+  | 'incorrecte';
+
+export interface OpenQuizEvaluationResult {
+  statut: OpenQuizAnswerStatus;
+  points: 1 | 0.5 | 0;
+  retour: string;
+  usedOfflineFallback?: boolean;
+  modelUsed?: string;
+}
+

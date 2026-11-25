@@ -1,8 +1,11 @@
 import type {
   GeminiChatTurn,
+  OpenQuizAnswerStatus,
+  OpenQuizEvaluationResult,
   QuizFormatPreference,
   QuizQuestion,
 } from '../types/course';
+import {normaliserTexte} from './db';
 
 const GEMINI_API_KEY_STORAGE_KEY = 'foliocours_gemini_api_key';
 const GEMINI_MODEL_STORAGE_KEY = 'foliocours_gemini_model';
@@ -23,6 +26,7 @@ const MODEL_DISCOVERY_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
 const QUIZ_REQUEST_TIMEOUT_MS = 30000;
 const EXPLAIN_REQUEST_TIMEOUT_MS = 15000;
+const OPEN_EVAL_REQUEST_TIMEOUT_MS = 12000;
 const PRIMARY_TRANSIENT_RETRY_DELAY_MS = 1500;
 
 interface CachedModelsRecord {
@@ -999,4 +1003,245 @@ export async function askGeminiSelectionExplain(params: {
     signal,
     onStatus,
   });
+}
+
+function extractNormalizedTokens(text: string): string[] {
+  return normaliserTexte(text)
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+export function evaluateOpenAnswerOffline(
+  userAnswer: string,
+  expectedAnswer: string
+): OpenQuizEvaluationResult {
+  const expectedNorm = normaliserTexte(expectedAnswer)
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+  const userNorm = normaliserTexte(userAnswer)
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+
+  if (!userNorm) {
+    return {
+      statut: 'incorrecte',
+      points: 0,
+      retour:
+        'Aucune notion clé attendue n’a été détectée dans ta réponse (évaluation locale hors-ligne).',
+      usedOfflineFallback: true,
+    };
+  }
+
+  const allExpectedTokens = extractNormalizedTokens(expectedAnswer);
+  const significantExpected = Array.from(
+    new Set(allExpectedTokens.filter((w) => w.length > 3))
+  );
+  const keywords =
+    significantExpected.length > 0
+      ? significantExpected
+      : Array.from(new Set(allExpectedTokens));
+
+  const userTokens = new Set(extractNormalizedTokens(userAnswer));
+
+  const matchesKeyword = (kw: string): boolean => {
+    if (userTokens.has(kw)) return true;
+    if (kw.length > 4 && kw.endsWith('s') && userTokens.has(kw.slice(0, -1))) {
+      return true;
+    }
+    if (userTokens.has(`${kw}s`)) return true;
+    return false;
+  };
+
+  let matchedCount = 0;
+  const missingKeywords: string[] = [];
+
+  for (const kw of keywords) {
+    if (matchesKeyword(kw)) {
+      matchedCount++;
+    } else {
+      missingKeywords.push(kw);
+    }
+  }
+
+  let ratio = keywords.length > 0 ? matchedCount / keywords.length : 0;
+  if (expectedNorm && (userNorm === expectedNorm || userNorm.includes(expectedNorm))) {
+    ratio = 1;
+  }
+
+  if (ratio >= 0.7) {
+    return {
+      statut: 'totalement_correcte',
+      points: 1,
+      retour:
+        'Les notions clés attendues sont bien présentes dans ta réponse (comparaison locale hors-ligne).',
+      usedOfflineFallback: true,
+    };
+  }
+
+  if (ratio >= 0.3) {
+    const missingHint =
+      missingKeywords.length > 0
+        ? ` Notions manquantes ou à préciser : ${missingKeywords.slice(0, 3).join(', ')}.`
+        : '';
+    return {
+      statut: 'partiellement_correcte',
+      points: 0.5,
+      retour: `Une partie des notions clés est présente, mais certains éléments restent incomplets.${missingHint} (Comparaison locale hors-ligne).`,
+      usedOfflineFallback: true,
+    };
+  }
+
+  const missingHint =
+    missingKeywords.length > 0
+      ? ` Mots-clés attendus non retrouvés : ${missingKeywords.slice(0, 3).join(', ')}.`
+      : '';
+  return {
+    statut: 'incorrecte',
+    points: 0,
+    retour: `Les notions clés de la réponse attendue n’ont pas été suffisamment retrouvées.${missingHint} (Comparaison locale hors-ligne).`,
+    usedOfflineFallback: true,
+  };
+}
+
+function normalizeEvaluatedStatus(
+  rawStatut: unknown,
+  rawPoints: unknown
+): OpenQuizAnswerStatus {
+  if (typeof rawStatut === 'string') {
+    const norm = rawStatut
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .trim()
+      .replace(/[\s-]+/g, '_');
+    if (norm === 'totalement_correcte' || norm === 'correcte' || norm === 'correct') {
+      return 'totalement_correcte';
+    }
+    if (norm === 'partiellement_correcte' || norm === 'partielle') {
+      return 'partiellement_correcte';
+    }
+    if (norm === 'incorrecte' || norm === 'incorrect' || norm === 'fausse') {
+      return 'incorrecte';
+    }
+  }
+
+  if (typeof rawPoints === 'number' && !Number.isNaN(rawPoints)) {
+    if (rawPoints >= 0.75) return 'totalement_correcte';
+    if (rawPoints >= 0.25) return 'partiellement_correcte';
+  }
+  return 'incorrecte';
+}
+
+function statusToPoints(statut: OpenQuizAnswerStatus): 1 | 0.5 | 0 {
+  if (statut === 'totalement_correcte') return 1;
+  if (statut === 'partiellement_correcte') return 0.5;
+  return 0;
+}
+
+export async function evaluateOpenQuizAnswer(params: {
+  question: string;
+  expectedAnswer: string;
+  referenceExplanation: string;
+  userAnswer: string;
+  signal?: AbortSignal;
+  onStatus?: (message: string) => void;
+}): Promise<OpenQuizEvaluationResult> {
+  const {
+    question,
+    expectedAnswer,
+    referenceExplanation,
+    userAnswer,
+    signal,
+    onStatus,
+  } = params;
+
+  if (signal?.aborted) {
+    throw new DOMException('Requête annulée.', 'AbortError');
+  }
+
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return evaluateOpenAnswerOffline(userAnswer, expectedAnswer);
+  }
+
+  if (!getEffectiveGeminiApiKey()) {
+    return evaluateOpenAnswerOffline(userAnswer, expectedAnswer);
+  }
+
+  const prompt = [
+    `Tu es un correcteur universitaire bienveillant et rigoureux. Évalue uniquement si l'étudiant a compris l'idée principale et les notions clés attendues, sans exiger du mot à mot (tolère les synonymes, les reformulations, les abréviations courantes et les fautes d'orthographe mineures).`,
+    ``,
+    `=== QUESTION ===`,
+    question,
+    ``,
+    `=== RÉPONSE ATTENDUE DU COURS ===`,
+    expectedAnswer,
+    ``,
+    `=== EXPLICATION DE RÉFÉRENCE ===`,
+    referenceExplanation,
+    ``,
+    `=== RÉPONSE DE L'ÉTUDIANT ===`,
+    userAnswer,
+    ``,
+    `=== CONSIGNE DE NOTATION ===`,
+    `- "totalement_correcte" (points: 1) : l'idée principale et les notions clés attendues sont comprises.`,
+    `- "partiellement_correcte" (points: 0.5) : une partie de l'idée est juste, mais au moins une notion clé importante manque ou reste imprécise.`,
+    `- "incorrecte" (points: 0) : la réponse est fausse, hors-sujet ou passe à côté des notions clés attendues.`,
+    ``,
+    `FORMAT DE SORTIE STRICT : Réponds UNIQUEMENT avec un objet JSON valide sans aucun texte avant ou après, suivant exactement cette structure :`,
+    `{"statut":"totalement_correcte","points":1,"retour":"1 à 2 phrases concises expliquant ce qui est juste, et précisant exactement quelle notion clé manque ou reste imprécise en cas de réponse partielle ou incorrecte."}`,
+  ].join('\n');
+
+  try {
+    const {text: rawResponse, modelUsed} = await appelerGeminiAvecSecours(prompt, {
+      signal,
+      onStatus,
+      timeoutMs: OPEN_EVAL_REQUEST_TIMEOUT_MS,
+      generationConfig: {
+        temperature: 0.1,
+      },
+    });
+
+    const cleanedText = rawResponse
+      .replace(/```json\s*/gi, '')
+      .replace(/```/g, '')
+      .trim();
+    const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
+    const jsonPayload = jsonMatch ? jsonMatch[0] : cleanedText;
+    const parsed = JSON.parse(jsonPayload) as {
+      statut?: unknown;
+      points?: unknown;
+      retour?: unknown;
+    };
+
+    const statut = normalizeEvaluatedStatus(parsed.statut, parsed.points);
+    const points = statusToPoints(statut);
+    const rawRetour =
+      typeof parsed.retour === 'string' ? parsed.retour.trim() : '';
+
+    const retour =
+      rawRetour ||
+      (statut === 'totalement_correcte'
+        ? 'Ta réponse exprime correctement l’idée principale et les notions clés attendues.'
+        : statut === 'partiellement_correcte'
+        ? 'L’idée générale est en partie présente, mais il manque encore une notion clé précise de la réponse attendue.'
+        : 'Ta réponse ne reprend pas les notions clés attendues dans le cours pour cette question.');
+
+    return {
+      statut,
+      points,
+      retour,
+      usedOfflineFallback: false,
+      modelUsed,
+    };
+  } catch (err) {
+    if (
+      signal?.aborted ||
+      (err instanceof DOMException && err.name === 'AbortError' && signal?.aborted)
+    ) {
+      throw err;
+    }
+    return evaluateOpenAnswerOffline(userAnswer, expectedAnswer);
+  }
 }

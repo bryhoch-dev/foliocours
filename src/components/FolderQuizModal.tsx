@@ -19,6 +19,7 @@ import type {
   AppMode,
   CloudSearchIndexPayload,
   CourseDocument,
+  OpenQuizAnswerStatus,
   QuizFolderTarget,
   QuizFormatPreference,
   QuizQuestion,
@@ -30,6 +31,7 @@ import {
   formatCourseDisplayTitle,
 } from '../services/parser';
 import {
+  evaluateOpenQuizAnswer,
   generateFolderQuiz,
   getEffectiveGeminiApiKey,
   getSavedGeminiModel,
@@ -61,15 +63,17 @@ interface QuestionAnswerState {
   openInput?: string;
   submitted: boolean;
   isCorrect: boolean | null;
+  points: number;
+  statut?: OpenQuizAnswerStatus;
+  retour?: string;
+  evaluatedOffline?: boolean;
 }
 
-function areOpenAnswersCloseEnough(userAnswer: string, expected: string): boolean {
-  const u = normaliserTexte(userAnswer).replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-  const e = normaliserTexte(expected).replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-  if (!u || !e) return false;
-  if (u === e) return true;
-  if (u.length >= 4 && (e.includes(u) || u.includes(e))) return true;
-  return false;
+function formatQuizScore(value: number): string {
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded)
+    ? String(rounded)
+    : rounded.toFixed(1).replace('.', ',');
 }
 
 function getParentDirKey(relativePath: string): string {
@@ -138,13 +142,18 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
   const [currentIdx, setCurrentIdx] = useState(0);
   const [answers, setAnswers] = useState<Record<number, QuestionAnswerState>>({});
   const [openDraft, setOpenDraft] = useState('');
+  const [evaluatingIdx, setEvaluatingIdx] = useState<number | null>(null);
+  const [evalStatusMessage, setEvalStatusMessage] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  const openEvalAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     if (!target) {
       abortRef.current?.abort();
       abortRef.current = null;
+      openEvalAbortRef.current?.abort();
+      openEvalAbortRef.current = null;
       return;
     }
 
@@ -163,11 +172,14 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
     setCurrentIdx(0);
     setAnswers({});
     setOpenDraft('');
+    setEvaluatingIdx(null);
+    setEvalStatusMessage(null);
   }, [target]);
 
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
+      openEvalAbortRef.current?.abort();
     };
   }, []);
 
@@ -379,40 +391,71 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
         selectedOption: option,
         submitted: true,
         isCorrect,
+        points: isCorrect ? 1 : 0,
+        statut: isCorrect ? 'totalement_correcte' : 'incorrecte',
       },
     }));
   };
 
-  const handleSubmitOpenAnswer = (qIndex: number) => {
+  const handleSubmitOpenAnswer = async (qIndex: number) => {
     const q = questions[qIndex];
-    if (!q) return;
     const trimmed = openDraft.trim();
-    const autoCorrect = trimmed
-      ? areOpenAnswersCloseEnough(trimmed, q.reponseCorrecte)
-      : false;
-    setAnswers((prev) => ({
-      ...prev,
-      [qIndex]: {
-        openInput: trimmed,
-        submitted: true,
-        isCorrect: autoCorrect,
-      },
-    }));
-  };
+    if (!q || trimmed.length < 2 || evaluatingIdx !== null || answers[qIndex]?.submitted) {
+      return;
+    }
 
-  const handleOverrideCorrectness = (qIndex: number, isCorrect: boolean) => {
-    setAnswers((prev) => ({
-      ...prev,
-      [qIndex]: {
-        ...(prev[qIndex] ?? {submitted: true}),
-        submitted: true,
-        isCorrect,
-      },
-    }));
+    openEvalAbortRef.current?.abort();
+    const controller = new AbortController();
+    openEvalAbortRef.current = controller;
+
+    setEvaluatingIdx(qIndex);
+    setEvalStatusMessage(null);
+
+    try {
+      const evaluation = await evaluateOpenQuizAnswer({
+        question: q.question,
+        expectedAnswer: q.reponseCorrecte,
+        referenceExplanation: q.explication,
+        userAnswer: trimmed,
+        signal: controller.signal,
+        onStatus: (msg) => {
+          setEvalStatusMessage(msg);
+        },
+      });
+
+      if (controller.signal.aborted) return;
+
+      setAnswers((prev) => ({
+        ...prev,
+        [qIndex]: {
+          openInput: trimmed,
+          submitted: true,
+          isCorrect: evaluation.points === 1,
+          points: evaluation.points,
+          statut: evaluation.statut,
+          retour: evaluation.retour,
+          evaluatedOffline: evaluation.usedOfflineFallback,
+        },
+      }));
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return;
+      }
+    } finally {
+      if (openEvalAbortRef.current === controller) {
+        openEvalAbortRef.current = null;
+        setEvaluatingIdx(null);
+        setEvalStatusMessage(null);
+      }
+    }
   };
 
   const goToQuestion = (nextIdx: number) => {
     if (nextIdx < 0 || nextIdx >= questions.length) return;
+    openEvalAbortRef.current?.abort();
+    openEvalAbortRef.current = null;
+    setEvaluatingIdx(null);
+    setEvalStatusMessage(null);
     setCurrentIdx(nextIdx);
     setOpenDraft(answers[nextIdx]?.openInput ?? '');
   };
@@ -421,11 +464,18 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
   const currentAnswer = answers[currentIdx];
 
   const answeredCount = Object.values(answers).filter((a) => a.submitted).length;
-  const correctCount = Object.values(answers).filter((a) => a.isCorrect === true).length;
-  const missedQuestions = questions.filter((_, idx) => answers[idx]?.isCorrect !== true);
+  const totalScore = Object.values(answers).reduce(
+    (sum, a) => sum + (a.submitted ? a.points : 0),
+    0
+  );
+  const missedQuestions = questions.filter((_, idx) => (answers[idx]?.points ?? 0) < 1);
 
   const handleReplayMissed = () => {
     if (missedQuestions.length === 0) return;
+    openEvalAbortRef.current?.abort();
+    openEvalAbortRef.current = null;
+    setEvaluatingIdx(null);
+    setEvalStatusMessage(null);
     setQuestions(missedQuestions);
     setAnswers({});
     setCurrentIdx(0);
@@ -437,7 +487,10 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-3 sm:p-4 backdrop-blur-xs"
       onClick={() => {
-        if (phase !== 'loading') onClose();
+        if (phase !== 'loading') {
+          openEvalAbortRef.current?.abort();
+          onClose();
+        }
       }}
     >
       <div
@@ -469,10 +522,10 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
                   : phase === 'loading'
                   ? 'Préparation du test de connaissances…'
                   : phase === 'quiz'
-                  ? `Question ${currentIdx + 1} sur ${questions.length} · ${correctCount} juste${
-                      correctCount > 1 ? 's' : ''
-                    }`
-                  : `Bilan final : ${correctCount} / ${questions.length}`}
+                  ? `Question ${currentIdx + 1} sur ${questions.length} · ${formatQuizScore(
+                      totalScore
+                    )} pt${totalScore > 1 ? 's' : ''}`
+                  : `Bilan final : ${formatQuizScore(totalScore)} / ${questions.length}`}
               </p>
             </div>
           </div>
@@ -481,6 +534,7 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
             type="button"
             onClick={() => {
               abortRef.current?.abort();
+              openEvalAbortRef.current?.abort();
               onClose();
             }}
             aria-label="Fermer"
@@ -713,9 +767,14 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
                   let style =
                     'border-slate-800 bg-[#0B1120] text-slate-400 hover:border-slate-700';
                   if (ans?.submitted) {
-                    style = ans.isCorrect
-                      ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
-                      : 'border-rose-500/50 bg-rose-500/15 text-rose-300';
+                    if (ans.points === 1) {
+                      style =
+                        'border-emerald-500/50 bg-emerald-500/15 text-emerald-300';
+                    } else if (ans.points === 0.5) {
+                      style = 'border-amber-500/60 bg-amber-500/15 text-amber-300';
+                    } else {
+                      style = 'border-rose-500/50 bg-rose-500/15 text-rose-300';
+                    }
                   }
                   if (isCurrent) {
                     style += ' ring-2 ring-amber-400/70';
@@ -804,100 +863,179 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
                     })}
                   </div>
                 ) : (
-                  <div className="space-y-3">
+                  <div className="space-y-2.5">
                     <textarea
                       rows={3}
-                      disabled={!!currentAnswer?.submitted}
+                      disabled={!!currentAnswer?.submitted || evaluatingIdx === currentIdx}
                       value={currentAnswer?.submitted ? currentAnswer.openInput ?? '' : openDraft}
                       onChange={(e) => setOpenDraft(e.target.value)}
-                      placeholder="Rédigez votre réponse courte ici…"
-                      className="w-full rounded-lg border border-slate-800 bg-[#0F172A] p-3 text-xs sm:text-sm text-slate-100 placeholder:text-slate-500 focus:border-amber-500/60 focus:outline-none disabled:opacity-75"
+                      onKeyDown={(e) => {
+                        if (
+                          e.key === 'Enter' &&
+                          (e.ctrlKey || e.metaKey || !e.shiftKey)
+                        ) {
+                          e.preventDefault();
+                          if (
+                            !currentAnswer?.submitted &&
+                            evaluatingIdx !== currentIdx &&
+                            openDraft.trim().length >= 2
+                          ) {
+                            void handleSubmitOpenAnswer(currentIdx);
+                          }
+                        }
+                      }}
+                      placeholder="Rédigez votre réponse libre ici (idée principale et notions clés)…"
+                      className="w-full rounded-lg border border-slate-800 bg-[#0F172A] p-3 text-xs sm:text-sm text-slate-100 placeholder:text-slate-500 focus:border-amber-500/60 focus:outline-none disabled:opacity-75 resize-y"
                     />
                     {!currentAnswer?.submitted && (
-                      <button
-                        type="button"
-                        onClick={() => handleSubmitOpenAnswer(currentIdx)}
-                        className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3.5 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 cursor-pointer"
-                      >
-                        <Check className="w-3.5 h-3.5" />
-                        <span>Vérifier la réponse</span>
-                      </button>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <button
+                          type="button"
+                          disabled={
+                            openDraft.trim().length < 2 || evaluatingIdx === currentIdx
+                          }
+                          onClick={() => void handleSubmitOpenAnswer(currentIdx)}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3.5 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer"
+                        >
+                          {evaluatingIdx === currentIdx ? (
+                            <>
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              <span>Analyse de ta réponse...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Check className="w-3.5 h-3.5" />
+                              <span>Valider ma réponse</span>
+                            </>
+                          )}
+                        </button>
+                        <span className="text-[11px] text-slate-400">
+                          {evaluatingIdx === currentIdx
+                            ? evalStatusMessage || 'Évaluation sémantique en cours…'
+                            : 'Entrée ou Ctrl + Entrée pour valider'}
+                        </span>
+                      </div>
                     )}
                   </div>
                 )}
 
                 {/* Immediate Correction & Explanation */}
-                {currentAnswer?.submitted && (
-                  <div
-                    className={`rounded-lg border p-3.5 space-y-2.5 text-xs ${
-                      currentAnswer.isCorrect
-                        ? 'border-emerald-500/40 bg-emerald-500/10'
-                        : 'border-amber-500/35 bg-amber-500/10'
-                    }`}
-                  >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <span
-                        className={`inline-flex items-center gap-1.5 font-semibold ${
-                          currentAnswer.isCorrect ? 'text-emerald-300' : 'text-amber-300'
-                        }`}
-                      >
-                        {currentAnswer.isCorrect ? (
-                          <>
-                            <CheckCircle2 className="w-4 h-4" />
-                            <span>Bonne réponse</span>
-                          </>
-                        ) : (
-                          <>
-                            <XCircle className="w-4 h-4 text-rose-400" />
-                            <span className="text-rose-300">À revoir</span>
-                          </>
-                        )}
-                      </span>
+                {currentAnswer?.submitted &&
+                  (currentQuestion.type === 'ouverte' ? (
+                    (() => {
+                      const statut: OpenQuizAnswerStatus =
+                        currentAnswer.statut ??
+                        (currentAnswer.points === 1
+                          ? 'totalement_correcte'
+                          : currentAnswer.points === 0.5
+                          ? 'partiellement_correcte'
+                          : 'incorrecte');
 
-                      {currentQuestion.type === 'ouverte' && (
-                        <div className="inline-flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => handleOverrideCorrectness(currentIdx, true)}
-                            className={`rounded px-2 py-1 text-[11px] font-medium cursor-pointer border ${
-                              currentAnswer.isCorrect
-                                ? 'border-emerald-500/60 bg-emerald-500/20 text-emerald-200'
-                                : 'border-slate-700 bg-slate-800 text-slate-300 hover:text-emerald-300'
-                            }`}
-                          >
-                            J’avais juste
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleOverrideCorrectness(currentIdx, false)}
-                            className={`rounded px-2 py-1 text-[11px] font-medium cursor-pointer border ${
-                              currentAnswer.isCorrect === false
-                                ? 'border-rose-500/60 bg-rose-500/20 text-rose-200'
-                                : 'border-slate-700 bg-slate-800 text-slate-300 hover:text-rose-300'
-                            }`}
-                          >
-                            À revoir
-                          </button>
+                      const containerClass =
+                        statut === 'totalement_correcte'
+                          ? 'border-emerald-500/40 bg-emerald-500/10'
+                          : statut === 'partiellement_correcte'
+                          ? 'border-amber-500/45 bg-amber-500/10'
+                          : 'border-rose-500/40 bg-rose-500/10';
+
+                      const badgeClass =
+                        statut === 'totalement_correcte'
+                          ? 'border-emerald-500/50 bg-emerald-500/20 text-emerald-300'
+                          : statut === 'partiellement_correcte'
+                          ? 'border-amber-500/50 bg-amber-500/20 text-amber-300'
+                          : 'border-rose-500/50 bg-rose-500/20 text-rose-300';
+
+                      const badgeLabel =
+                        statut === 'totalement_correcte'
+                          ? 'Totalement correcte (+1 pt)'
+                          : statut === 'partiellement_correcte'
+                          ? 'Partiellement correcte (+0,5 pt)'
+                          : 'Incorrecte (0 pt)';
+
+                      return (
+                        <div className={`rounded-lg border p-3.5 space-y-3 text-xs ${containerClass}`}>
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span
+                              className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 font-semibold ${badgeClass}`}
+                            >
+                              {statut === 'totalement_correcte' ? (
+                                <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                              ) : statut === 'partiellement_correcte' ? (
+                                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                              ) : (
+                                <XCircle className="w-3.5 h-3.5 shrink-0" />
+                              )}
+                              <span>{badgeLabel}</span>
+                            </span>
+
+                            {currentAnswer.evaluatedOffline && (
+                              <span className="inline-flex items-center gap-1 text-[11px] text-slate-400">
+                                <WifiOff className="w-3 h-3 shrink-0" />
+                                <span>Comparaison locale hors-ligne</span>
+                              </span>
+                            )}
+                          </div>
+
+                          {currentAnswer.retour && (
+                            <p className="text-slate-100 leading-relaxed">
+                              {currentAnswer.retour}
+                            </p>
+                          )}
+
+                          <div className="rounded-md bg-[#0B1120]/85 border border-slate-800 p-3 space-y-2 text-slate-200">
+                            <div>
+                              <span className="text-[11px] uppercase tracking-wide text-slate-400 block mb-0.5">
+                                Réponse attendue de référence
+                              </span>
+                              <p className="leading-relaxed font-medium text-slate-100">
+                                {currentQuestion.reponseCorrecte}
+                              </p>
+                            </div>
+                            <div className="pt-1.5 border-t border-slate-800/80">
+                              <span className="text-[11px] uppercase tracking-wide text-slate-400 block mb-0.5">
+                                Explication du cours
+                              </span>
+                              <p className="leading-relaxed text-slate-300">
+                                {currentQuestion.explication}
+                              </p>
+                            </div>
+                          </div>
                         </div>
-                      )}
-                    </div>
-
-                    {currentQuestion.type === 'ouverte' && (
-                      <div className="rounded-md bg-[#0B1120]/80 border border-slate-800 p-2.5 text-slate-200">
-                        <span className="text-[11px] uppercase tracking-wide text-slate-400 block mb-0.5">
-                          Réponse attendue
+                      );
+                    })()
+                  ) : (
+                    <div
+                      className={`rounded-lg border p-3.5 space-y-2.5 text-xs ${
+                        currentAnswer.isCorrect
+                          ? 'border-emerald-500/40 bg-emerald-500/10'
+                          : 'border-amber-500/35 bg-amber-500/10'
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span
+                          className={`inline-flex items-center gap-1.5 font-semibold ${
+                            currentAnswer.isCorrect ? 'text-emerald-300' : 'text-amber-300'
+                          }`}
+                        >
+                          {currentAnswer.isCorrect ? (
+                            <>
+                              <CheckCircle2 className="w-4 h-4" />
+                              <span>Bonne réponse</span>
+                            </>
+                          ) : (
+                            <>
+                              <XCircle className="w-4 h-4 text-rose-400" />
+                              <span className="text-rose-300">À revoir</span>
+                            </>
+                          )}
                         </span>
-                        <p className="leading-relaxed font-medium">
-                          {currentQuestion.reponseCorrecte}
-                        </p>
                       </div>
-                    )}
 
-                    <p className="text-slate-200 leading-relaxed">
-                      {currentQuestion.explication}
-                    </p>
-                  </div>
-                )}
+                      <p className="text-slate-200 leading-relaxed">
+                        {currentQuestion.explication}
+                      </p>
+                    </div>
+                  ))}
               </div>
             </div>
           )}
@@ -909,10 +1047,10 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
                   Score final
                 </p>
                 <p className="font-display text-3xl font-bold text-amber-400 tabular-nums">
-                  {correctCount} / {questions.length}
+                  {formatQuizScore(totalScore)} / {questions.length}
                 </p>
                 <p className="text-xs text-slate-300">
-                  {Math.round((correctCount / Math.max(1, questions.length)) * 100)}% de réussite
+                  {Math.round((totalScore / Math.max(1, questions.length)) * 100)}% de réussite
                   {missedQuestions.length === 0
                     ? ' — Maîtrise parfaite sur cette série !'
                     : ` · ${missedQuestions.length} question${
@@ -924,13 +1062,17 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
               <div className="space-y-2.5">
                 {questions.map((q, idx) => {
                   const ans = answers[idx];
-                  const ok = ans?.isCorrect === true;
+                  const pts = ans?.submitted ? ans.points : 0;
+                  const isFull = pts === 1;
+                  const isPartial = pts === 0.5;
                   return (
                     <div
                       key={idx}
                       className={`rounded-lg border p-3.5 text-xs space-y-1.5 ${
-                        ok
+                        isFull
                           ? 'border-emerald-500/30 bg-emerald-500/5'
+                          : isPartial
+                          ? 'border-amber-500/35 bg-amber-500/5'
                           : 'border-rose-500/30 bg-rose-500/5'
                       }`}
                     >
@@ -938,12 +1080,20 @@ export const FolderQuizModal: React.FC<FolderQuizModalProps> = ({
                         <p className="font-medium text-slate-100 leading-snug">
                           {idx + 1}. {q.question}
                         </p>
-                        {ok ? (
+                        {isFull ? (
                           <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                        ) : isPartial ? (
+                          <span className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300 shrink-0">
+                            <AlertCircle className="w-3 h-3" />
+                            <span>+0,5 pt</span>
+                          </span>
                         ) : (
                           <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
                         )}
                       </div>
+                      {q.type === 'ouverte' && ans?.retour && (
+                        <p className="text-slate-200 leading-relaxed">{ans.retour}</p>
+                      )}
                       <p className="text-emerald-300">
                         Réponse : <span className="font-medium">{q.reponseCorrecte}</span>
                       </p>
